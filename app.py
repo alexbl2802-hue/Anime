@@ -36,6 +36,16 @@ FFMPEG_URLS = [
     "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
 ]
 TORCH_INDEX = "https://download.pytorch.org/whl/cu124"
+# Зеркала на случай, если провайдер или антивирус режет pypi.org / download.pytorch.org.
+# Перед установкой проверяется, какое отвечает, и берётся первое рабочее.
+PYPI_MIRRORS = ["https://pypi.org/simple",
+                "https://mirrors.aliyun.com/pypi/simple",
+                "https://pypi.tuna.tsinghua.edu.cn/simple",
+                "https://mirrors.cloud.tencent.com/pypi/simple"]
+# ("index", url) — каталог в формате PyPI; ("links", url) — страница со списком файлов
+TORCH_SOURCES = [("index", TORCH_INDEX),
+                 ("links", "https://mirrors.aliyun.com/pytorch-wheels/cu124/"),
+                 ("index", "https://mirrors.nju.edu.cn/pytorch/whl/cu124")]
 TORCH_PINS = ["torch==2.5.1", "torchaudio==2.5.1"]  # новее ломают demucs (torch.load) и torchaudio.load
 REQS = ["coqui-tts", "faster-whisper", "demucs", "anthropic", "soundfile", "librosa"]
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -105,6 +115,25 @@ def python_ok(cmd):
         return False
 
 
+def reachable(url, must_contain=""):
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "pip/24.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = r.read(4 << 20).decode("utf-8", "replace")
+        return r.status == 200 and must_contain in body
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def pick_sources():
+    """Первое отвечающее зеркало PyPI и первый источник PyTorch 2.5.1."""
+    pypi = next((u for u in PYPI_MIRRORS if reachable(u + "/pip/", "pip-")), None)
+    torch = next(((kind, u) for kind, u in TORCH_SOURCES
+                  if reachable(u.rstrip("/") + "/torch/" if kind == "index" else u,
+                               "torch-2.5.1")), None)
+    return pypi, torch
+
+
 def explain_failure(tail):
     """Понятная причина ошибки pip/Python по последним строкам вывода."""
     text = "\n".join(tail)
@@ -116,6 +145,10 @@ def explain_failure(tail):
          "Не удалось найти пакет. Чаще всего не открывается сайт download.pytorch.org — проверь "
          "интернет, выключи VPN/прокси или разреши AnimeDub в антивирусе. Если не поможет, удали "
          "папку %LOCALAPPDATA%\\AnimeDub\\venv и снова нажми «Установить компоненты»."),
+        (("10054", "connectionreseterror", "connection aborted"),
+         "Сервер с пакетами разрывает соединение — так бывает, когда его блокирует провайдер "
+         "или антивирус. Включи VPN (или выключи, если он уже включён) либо временно отключи "
+         "проверку HTTPS в антивирусе и нажми «Установить компоненты» ещё раз."),
         (("readtimeout", "timed out", "connection reset", "connectionerror", "incompleteread",
           "remote end closed", "max retries exceeded", "connection broken"),
          "Оборвалось соединение при скачивании. Нажми «Установить компоненты» ещё раз — "
@@ -564,11 +597,48 @@ class App(tk.Tk):
         if VPY.exists() and not python_ok([str(VPY)]):
             self.q.put(("log", "Окружение создано неподходящим Python — пересоздаю.\n"))
             shutil.rmtree(VENV, ignore_errors=True)
-        pip = [str(VPY), "-m", "pip", "install", "--disable-pip-version-check",
-               "--timeout", "60", "--retries", "10"]
         py = find_python()
         has_ffmpeg = (shutil.which("ffmpeg", path=child_env()["PATH"])
                       and shutil.which("ffprobe", path=child_env()["PATH"]))
+        net = {}  # заполняется шагом проверки серверов, читается следующими шагами
+
+        def pip(*extra):
+            cmd = [str(VPY), "-m", "pip", "install", "--disable-pip-version-check",
+                   "--timeout", "60", "--retries", "10", "-i", net["pypi"]]
+            # --progress-bar raw есть с pip 24.1, --resume-retries — с 25.1
+            cmd += ["--progress-bar", "raw" if net["pip"] >= (24, 1) else "off"]
+            if net["pip"] >= (25, 1):
+                cmd += ["--resume-retries", "10"]
+            return cmd + list(extra)
+
+        def torch_args():
+            kind, url = net["torch"]
+            return ["--extra-index-url", url] if kind == "index" else ["-f", url]
+
+        def check_servers():
+            pypi, torch = pick_sources()
+            if not pypi:
+                raise StepFailed("Не открывается ни pypi.org, ни его зеркала — похоже, их блокирует "
+                                 "провайдер или антивирус. Включи VPN (или выключи, если он уже "
+                                 "включён) и нажми «Установить компоненты» ещё раз.")
+            if not torch:
+                raise StepFailed("Не открывается download.pytorch.org и его зеркала. Включи VPN "
+                                 "(или выключи, если он уже включён) и попробуй ещё раз.")
+            net.update(pypi=pypi, torch=torch, pip=(0, 0))
+            self.q.put(("log", f"Пакеты: {pypi}\nPyTorch: {torch[1]}\n"))
+
+        def upgrade_pip():
+            try:
+                self._stream("Обновление pip", pip("--upgrade", "pip"))
+            except StepFailed as e:
+                if self.stopping:
+                    raise
+                self.q.put(("log", f"pip обновить не удалось, продолжаю со старым ({e})\n"))
+            r = subprocess.run([str(VPY), "-c", "import pip;print(pip.__version__)"],
+                               capture_output=True, text=True, creationflags=NO_WINDOW)
+            nums = re.findall(r"\d+", r.stdout)[:2]
+            net["pip"] = tuple(int(n) for n in nums) if len(nums) == 2 else (0, 0)
+
         # (заголовок, вес в общем проценте, действие); вес ~ время шага
         steps = []
         if not py:
@@ -579,15 +649,12 @@ class App(tk.Tk):
             steps.append(("Создание окружения", 2, lambda: self._stream(
                 "Создание окружения", (find_python() or []) + ["-m", "venv", str(VENV)])))
         steps += [
-            ("Обновление pip", 2, lambda: self._stream(
-                "Обновление pip", pip + ["--progress-bar", "off", "--upgrade", "pip"])),
+            ("Проверка доступа к серверам", 1, check_servers),
+            ("Обновление pip", 2, upgrade_pip),
             ("PyTorch с поддержкой видеокарты (~3 ГБ)", 45, lambda: self._stream(
-                "PyTorch", pip + ["--progress-bar", "raw", "--resume-retries", "10"] + TORCH_PINS
-                + ["--index-url", TORCH_INDEX])),
+                "PyTorch", pip(*TORCH_PINS, *torch_args()))),
             ("Нейросети и библиотеки", 40, lambda: self._stream(
-                "Нейросети и библиотеки", pip + ["--progress-bar", "raw", "--resume-retries", "10"]
-                + REQS + TORCH_PINS
-                + ["--extra-index-url", TORCH_INDEX])),
+                "Нейросети и библиотеки", pip(*REQS, *TORCH_PINS, *torch_args()))),
             ("Проверка видеокарты", 3, lambda: self._stream(
                 "Проверка видеокарты", [str(VPY), "-c", GPU_CHECK])),
         ]
