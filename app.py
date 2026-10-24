@@ -30,6 +30,16 @@ VPY = VENV / "Scripts" / "python.exe"
 CONFIG = APP_DIR / "config.json"
 PY_DIR = APP_DIR / "python311"
 FFMPEG_DIR = APP_DIR / "ffmpeg"
+OLLAMA_URLS = ["https://ollama.com/download/OllamaSetup.exe",
+               "https://github.com/ollama/ollama/releases/latest/download/OllamaSetup.exe"]
+OLLAMA_API = "http://127.0.0.1:11434"
+TRANSLATORS = [("Локально — бесплатно, без ключа", "local"),
+               ("Claude — лучше качество, нужен ключ", "claude")]
+# модель перевода под память видеокарты: (до ГБ, модель, размер)
+LOCAL_MODELS = [(11, "qwen2.5:7b", "4.7 ГБ"), (20, "qwen2.5:14b", "9 ГБ"),
+                (999, "qwen2.5:32b", "20 ГБ")]
+VRAM_CHECK = ("import torch;print(torch.cuda.get_device_properties(0).total_memory / 2**30 "
+              "if torch.cuda.is_available() else 0)")
 PY_URLS = ["https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"]
 FFMPEG_URLS = [
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
@@ -168,6 +178,27 @@ def explain_failure(tail):
     return ""
 
 
+def ollama_exe():
+    p = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe"
+    return str(p) if p.exists() else shutil.which("ollama")
+
+
+def ollama_up():
+    try:
+        with urllib.request.urlopen(OLLAMA_API + "/api/version", timeout=3):
+            return True
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def ollama_models():
+    try:
+        with urllib.request.urlopen(OLLAMA_API + "/api/tags", timeout=10) as r:
+            return {m["name"] for m in json.loads(r.read().decode("utf-8")).get("models", [])}
+    except (urllib.error.URLError, OSError, ValueError):
+        return set()
+
+
 def mb(n):
     return f"{n / 2**30:.2f} ГБ" if n >= 2**30 else f"{n / 2**20:.0f} МБ"
 
@@ -209,7 +240,7 @@ class App(tk.Tk):
         self.after(100, self._poll)
         if not self.cfg.get("installed"):
             self.log("Первый запуск: нажми «Установить компоненты».\n"
-                     "Скачается около 10 ГБ, это займёт 20–60 минут.\n")
+                     "Скачается около 15 ГБ, это займёт 30–90 минут.\n")
 
     # --- интерфейс ---
     def _build(self):
@@ -233,10 +264,21 @@ class App(tk.Tk):
         ttk.Checkbutton(row, text="Оставлять -сан, -кун, -тян",
                         variable=self.honor).pack(side="left", padx=12)
 
-        ttk.Label(top, text="Ключ Claude API:").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Label(top, text="Переводчик:").grid(row=2, column=0, sticky="w", **pad)
+        trow = ttk.Frame(top)
+        trow.grid(row=2, column=1, columnspan=2, sticky="ew")
+        trow.columnconfigure(3, weight=1)
+        names = dict((v, n) for n, v in TRANSLATORS)
+        self.translator = tk.StringVar(value=names[self.cfg.get("translator", "local")])
+        ttk.Combobox(trow, textvariable=self.translator, values=[n for n, _ in TRANSLATORS],
+                     state="readonly", width=34).grid(row=0, column=0, padx=6)
+        self.key_label = ttk.Label(trow, text="Ключ Claude:")
+        self.key_label.grid(row=0, column=2, padx=(12, 4))
         self.key = tk.StringVar(value=self.cfg.get("api_key", ""))
-        ttk.Entry(top, textvariable=self.key, show="•").grid(row=2, column=1, columnspan=2,
-                                                             sticky="ew", **pad)
+        self.key_entry = ttk.Entry(trow, textvariable=self.key, show="•")
+        self.key_entry.grid(row=0, column=3, sticky="ew", padx=6)
+        self.translator.trace_add("write", lambda *_: self._toggle_key())
+        self._toggle_key()
 
         ttk.Label(top, text="Персонажи и манера\nречи (для перевода):").grid(
             row=3, column=0, sticky="nw", **pad)
@@ -322,6 +364,16 @@ class App(tk.Tk):
             b.configure(state="disabled" if busy else "normal")
         self.b_stop.configure(state="normal" if busy else "disabled")
 
+    def _translator(self):
+        return dict(TRANSLATORS).get(self.translator.get(), "local")
+
+    def _toggle_key(self):
+        for w in (self.key_label, self.key_entry):
+            if self._translator() == "claude":
+                w.grid()
+            else:
+                w.grid_remove()
+
     # --- выбор видео и контекста ---
     def pick_video(self):
         f = filedialog.askopenfilename(
@@ -345,6 +397,7 @@ class App(tk.Tk):
     def _save_settings(self):
         ctx = self.ctx.get("1.0", "end").strip()
         self.cfg.update(api_key=self.key.get().strip(), lang_name=self.lang.get(),
+                        translator=self._translator(),
                         honorifics=self.honor.get(), voice_gain=round(self.vgain.get(), 2),
                         bg_gain=round(self.bgain.get(), 2), last_video=self.video.get(),
                         last_ctx=ctx)
@@ -524,7 +577,7 @@ class App(tk.Tk):
     # --- установка ---
     def setup(self):
         if not messagebox.askyesno(
-                APP_NAME, "Будет скачано около 10 ГБ (Python, PyTorch, нейросети).\n"
+                APP_NAME, "Будет скачано около 15 ГБ (Python, PyTorch, нейросети, переводчик).\n"
                           "Это займёт 20–60 минут. Продолжить?"):
             return
         self.run_task(self._setup, lambda: messagebox.showinfo(
@@ -594,11 +647,84 @@ class App(tk.Tk):
             z.unlink(missing_ok=True)
         self.q.put(("log", f"ffmpeg установлен в {FFMPEG_DIR / 'bin'}\n"))
 
+    def _ensure_ollama(self):
+        if ollama_up():
+            return
+        exe = ollama_exe()
+        if not exe:
+            raise StepFailed("Ollama не установилась. Нажми «Установить компоненты» ещё раз.")
+        subprocess.Popen([exe, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=NO_WINDOW, env=child_env())
+        for _ in range(60):
+            if self.stopping:
+                raise StepFailed("Остановлено")
+            time.sleep(1)
+            if ollama_up():
+                return
+        raise StepFailed("Ollama установлена, но не запускается. Перезапусти компьютер и "
+                         "снова нажми «Установить компоненты».")
+
+    def _install_ollama(self):
+        exe = APP_DIR / "OllamaSetup.exe"
+        self._download(OLLAMA_URLS, exe)
+        self.q.put(("progress", (0.9, "установка без окон, 1–2 минуты")))
+        self._stream("Установка Ollama", [str(exe), "/VERYSILENT", "/NORESTART",
+                                          "/SUPPRESSMSGBOXES"])
+        exe.unlink(missing_ok=True)
+        self._ensure_ollama()
+
+    def _pull_model(self, model):
+        self._ensure_ollama()
+        if model in ollama_models():
+            return
+        self.q.put(("log", f"\n▶ Скачивание модели перевода {model}\n"))
+        body = json.dumps({"model": model, "stream": True}).encode("utf-8")
+        req = urllib.request.Request(OLLAMA_API + "/api/pull", data=body,
+                                     headers={"Content-Type": "application/json"})
+        shown = 0.0
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                for raw in r:
+                    if self.stopping:
+                        raise StepFailed("Остановлено")
+                    try:
+                        msg = json.loads(raw.decode("utf-8"))
+                    except ValueError:
+                        continue
+                    if msg.get("error"):
+                        raise StepFailed(f"Не удалось скачать модель: {msg['error']}. Если "
+                                         "серверы Ollama недоступны — включи VPN и попробуй снова.")
+                    total, done = msg.get("total") or 0, msg.get("completed") or 0
+                    if total > 50 * 2**20 and time.monotonic() - shown > 0.3:
+                        shown = time.monotonic()
+                        self.q.put(("progress", (done / total, f"{done * 100 // total}% "
+                                                 f"({mb(done)} из {mb(total)})")))
+                    elif msg.get("status") and not total:
+                        self.q.put(("log", msg["status"] + "\n"))
+        except (urllib.error.URLError, OSError) as e:
+            raise StepFailed(f"Обрыв при скачивании модели ({e}). Нажми «Установить компоненты» "
+                             "ещё раз — скачивание продолжится с того же места.")
+        if model not in ollama_models():
+            raise StepFailed("Модель перевода не скачалась. Нажми «Установить компоненты» ещё раз.")
+
+    def _choose_model(self):
+        r = subprocess.run([str(VPY), "-c", VRAM_CHECK], capture_output=True, text=True,
+                           creationflags=NO_WINDOW, env=child_env())
+        try:
+            vram = float(r.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            vram = 0
+        model, size = next((m, s) for limit, m, s in LOCAL_MODELS if vram < limit)
+        self.cfg["local_model"] = model
+        save_cfg(self.cfg)
+        self.q.put(("log", f"Память видеокарты: {vram:.1f} ГБ → модель перевода {model} ({size})\n"))
+        return model
+
     def _setup(self):
         APP_DIR.mkdir(parents=True, exist_ok=True)
         free = shutil.disk_usage(APP_DIR).free
-        if free < 15 * 2**30 and not self.cfg.get("installed"):
-            raise StepFailed(f"На диске свободно {mb(free)}, а для установки нужно около 15 ГБ. "
+        if free < 21 * 2**30 and not self.cfg.get("installed"):
+            raise StepFailed(f"На диске свободно {mb(free)}, а для установки нужно около 21 ГБ. "
                              "Освободи место и нажми «Установить компоненты» ещё раз.")
         if VPY.exists() and not python_ok([str(VPY)]):
             self.q.put(("log", "Окружение создано неподходящим Python — пересоздаю.\n"))
@@ -661,9 +787,12 @@ class App(tk.Tk):
                 "PyTorch", pip(*TORCH_PINS, *torch_args()))),
             ("Нейросети и библиотеки", 40, lambda: self._stream(
                 "Нейросети и библиотеки", pip(*REQS, *TORCH_PINS, *torch_args()))),
-            ("Проверка видеокарты", 3, lambda: self._stream(
+            ("Проверка видеокарты", 2, lambda: self._stream(
                 "Проверка видеокарты", [str(VPY), "-c", GPU_CHECK])),
         ]
+        if not ollama_exe():
+            steps.append(("Локальный переводчик Ollama (~1 ГБ)", 8, self._install_ollama))
+        steps.append(("Модель перевода (~5 ГБ)", 30, lambda: self._pull_model(self._choose_model())))
         total = sum(w for _, w, _ in steps)
         done = 0
         for n, (title, weight, action) in enumerate(steps, 1):
@@ -701,9 +830,15 @@ class App(tk.Tk):
         if not self._ready():
             return
         ctx = self._save_settings()
-        if self._needs_translation() and not self.cfg.get("api_key"):
-            messagebox.showwarning(APP_NAME, "Для перевода нужен ключ Claude API "
-                                             "(console.anthropic.com).")
+        local = self._translator() == "local"
+        if self._needs_translation() and not local and not self.cfg.get("api_key"):
+            messagebox.showwarning(APP_NAME, "Для перевода через Claude нужен ключ "
+                                             "(console.anthropic.com). Или выбери переводчик "
+                                             "«Локально — бесплатно».")
+            return
+        if self._needs_translation() and local and not self.cfg.get("local_model"):
+            messagebox.showwarning(APP_NAME, "Локальный переводчик ещё не установлен. "
+                                             "Нажми «Установить компоненты».")
             return
         video = self.video.get()
         wd = work_dir(video)
@@ -717,6 +852,9 @@ class App(tk.Tk):
                "--bg-gain", str(self.cfg["bg_gain"])]
         if self.honor.get():
             cmd.append("--keep-honorifics")
+        cmd += ["--translator", self._translator()]
+        if local:
+            cmd += ["--local-model", self.cfg["local_model"]]
         if until:
             cmd += ["--until", until]
             title, done = "Распознавание и перевод", self.open_editor
