@@ -1,12 +1,21 @@
 name: Сборка AnimeDub.exe
 
+# Собирается сама при каждом изменении кода; готовый exe публикуется в Releases.
+# Постоянная ссылка на последнюю сборку:
+#   https://github.com/<владелец>/<репозиторий>/releases/latest/download/AnimeDub.exe
 on:
   push:
+    branches: ["**"]
     tags: ["v*"]
+    paths-ignore: ["README.md", ".gitignore"]
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -24,6 +33,9 @@ jobs:
       - name: Сборка exe
         run: pyinstaller --noconfirm --onefile --windowed --name AnimeDub --add-data "dub.py;." app.py
 
+      - name: Упаковка в zip
+        run: Compress-Archive -Path dist/AnimeDub.exe -DestinationPath dist/AnimeDub.zip
+
       - name: Загрузка как артефакт
         uses: actions/upload-artifact@v4
         with:
@@ -31,7 +43,13 @@ jobs:
           path: dist/AnimeDub.exe
 
       - name: Публикация релиза
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/AnimeDub.exe
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build-{0}', github.run_number) }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('Сборка {0}', github.run_number) }}
+          target_commitish: ${{ github.sha }}
+          body: "Автосборка из ветки `${{ github.ref_name }}`, коммит ${{ github.sha }}."
+          make_latest: true
+          files: |
+            dist/AnimeDub.exe
+            dist/AnimeDub.zip
