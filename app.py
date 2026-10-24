@@ -21,7 +21,7 @@ import zipfile
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from server import PORT, PhoneServer, addresses, new_key
+from server import PORT, PhoneServer, Thumbs, addresses, new_key
 
 APP_NAME = "AnimeDub"
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME
@@ -352,6 +352,11 @@ class App(tk.Tk):
         return ctx
 
     # --- доступ с телефона ---
+    @staticmethod
+    def _ffmpeg_dir():
+        exe = shutil.which("ffmpeg", path=child_env()["PATH"])
+        return str(Path(exe).parent) if exe else None
+
     def _library(self):
         return list(self.cfg.get("library", []))
 
@@ -388,7 +393,8 @@ class App(tk.Tk):
         if self.phone_on.get():
             key = self.cfg.setdefault("phone_key", new_key())
             try:
-                self.phone = PhoneServer(key, self._library)
+                self.phone = PhoneServer(key, self._library, thumbs=Thumbs(
+                    APP_DIR / "thumbs", self._ffmpeg_dir))
             except OSError as e:
                 self.phone_on.set(False)
                 messagebox.showerror(APP_NAME, f"Не удалось открыть порт {PORT}: {e}")

@@ -13,7 +13,7 @@ android {
         targetSdk = 34
         // Номер сборки GitHub растёт с каждым запуском — новая версия ставится поверх старой.
         versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
-        versionName = "1.0.$versionCode"
+        versionName = "1.1.$versionCode"
     }
 
     // Один и тот же ключ для всех сборок, иначе Android не даст обновить приложение.
@@ -50,4 +50,6 @@ android {
 dependencies {
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-ui:1.4.1")
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
+    implementation("androidx.drawerlayout:drawerlayout:1.2.0")
 }

@@ -10,7 +10,9 @@ import ipaddress
 import json
 import re
 import secrets
+import os
 import socket
+import subprocess
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +22,7 @@ PORT = 8765
 DUB_RE = re.compile(r"^(?P<title>.+)_dub_(?P<lang>[a-z]{2})\.(?P<ext>mkv|mp4)$", re.IGNORECASE)
 MIME = {"mkv": "video/x-matroska", "mp4": "video/mp4"}
 CHUNK = 1 << 20
+NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 KEY_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"  # без похожих символов: l/1, o/0
 
 
@@ -49,6 +52,11 @@ def scan(folders):
                 "folder": d.name, "size": st.st_size, "mtime": int(st.st_mtime),
                 "mime": MIME[m["ext"].lower()]}
     return items
+
+
+def natural_key(text):
+    """«Серия 2» раньше «Серия 10»."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", text)]
 
 
 def addresses():
@@ -107,8 +115,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"app": "AnimeDub", "name": socket.gethostname(), "version": 1})
         if url.path == "/api/list":
             items = sorted(scan(self.server.folders()).values(),
-                           key=lambda i: (i["folder"].lower(), i["title"].lower()))
+                           key=lambda i: (i["folder"].lower(), natural_key(i["title"])))
             return self._json(200, [{k: v for k, v in i.items() if k != "path"} for i in items])
+        if url.path.startswith("/thumb/"):
+            item = scan(self.server.folders()).get(url.path[len("/thumb/"):])
+            data = self.server.thumb(item) if item else None
+            if not data:
+                return self._json(404, {"error": "Нет кадра"})
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "max-age=604800")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(data)
+            return
         if url.path.startswith("/video/"):
             item = scan(self.server.folders()).get(url.path[len("/video/"):])
             if not item:
@@ -157,14 +178,61 @@ class Handler(BaseHTTPRequestHandler):
             pass  # телефон перемотал или закрыл плеер
 
 
+class Thumbs:
+    """Кадр из серии (на 30% длительности) для обложек в приложении, с кэшем на диске."""
+
+    def __init__(self, cache_dir, ffmpeg_dir):
+        self.cache = Path(cache_dir)
+        self.ffmpeg_dir = ffmpeg_dir  # функция: папка с ffmpeg.exe/ffprobe.exe или None
+        self.sem = threading.Semaphore(2)
+        self.lock = threading.Lock()
+        self.busy = {}
+
+    def _tool(self, name):
+        d = self.ffmpeg_dir()
+        exe = name + (".exe" if os.name == "nt" else "")
+        return str(Path(d) / exe) if d else None
+
+    def __call__(self, item):
+        out = self.cache / f"{item['id']}_{item['mtime']}.jpg"
+        if out.exists():
+            return out.read_bytes()
+        with self.lock:
+            ev = self.busy.setdefault(out.name, threading.Lock())
+        with ev, self.sem:  # один и тот же кадр не делаем дважды
+            if out.exists():
+                return out.read_bytes()
+            ffmpeg, ffprobe = self._tool("ffmpeg"), self._tool("ffprobe")
+            if not ffmpeg:
+                return None
+            self.cache.mkdir(parents=True, exist_ok=True)
+            at = 90.0
+            try:
+                r = subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=duration",
+                                    "-of", "csv=p=0", str(item["path"])], capture_output=True,
+                                   text=True, timeout=30, creationflags=NO_WINDOW)
+                at = float(r.stdout.strip()) * 0.3
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                pass
+            try:
+                subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-ss", f"{at:.1f}",
+                                "-i", str(item["path"]), "-frames:v", "1",
+                                "-vf", "scale=640:-2", "-q:v", "5", str(out)],
+                               capture_output=True, timeout=60, creationflags=NO_WINDOW)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            return out.read_bytes() if out.exists() else None
+
+
 class PhoneServer:
     """Сервер в фоновом потоке. folders — функция, возвращающая папки библиотеки."""
 
-    def __init__(self, key, folders, port=PORT):
+    def __init__(self, key, folders, port=PORT, thumbs=None):
         self.httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
         self.httpd.daemon_threads = True
         self.httpd.key = key.lower()
         self.httpd.folders = folders
+        self.httpd.thumb = thumbs or (lambda item: None)
         self.port = port
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 

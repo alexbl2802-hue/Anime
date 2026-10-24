@@ -16,20 +16,27 @@ data class Episode(
     val size: Long,
 )
 
+/** Аниме = папка с сериями на компьютере. */
+data class Anime(val name: String, val episodes: List<Episode>) {
+    val cover: Episode get() = episodes.first()
+}
+
 class ApiException(message: String) : IOException(message)
 
 /** Связь с AnimeDub на компьютере (server.py). */
 class Api(host: String, val key: String) {
     val base: String = normalize(host)
 
-    fun videoUrl(e: Episode) = "$base/video/${e.id}"
+    fun videoUrl(id: String) = "$base/video/$id"
+
+    fun thumbUrl(id: String) = "$base/thumb/$id"
 
     fun check() {
-        get("/api/info")
+        String(get("/api/info"), Charsets.UTF_8)
     }
 
     fun list(): List<Episode> {
-        val arr = JSONArray(get("/api/list"))
+        val arr = JSONArray(String(get("/api/list"), Charsets.UTF_8))
         return (0 until arr.length()).map {
             val o = arr.getJSONObject(it)
             Episode(o.getString("id"), o.getString("title"), o.getString("lang"),
@@ -37,10 +44,14 @@ class Api(host: String, val key: String) {
         }
     }
 
-    private fun get(path: String): String {
-        val conn = URL(base + path).openConnection() as HttpURLConnection
+    fun bytes(url: String): ByteArray = fetch(URL(url))
+
+    private fun get(path: String): ByteArray = fetch(URL(base + path))
+
+    private fun fetch(url: URL): ByteArray {
+        val conn = url.openConnection() as HttpURLConnection
         conn.connectTimeout = 8000
-        conn.readTimeout = 15000
+        conn.readTimeout = 60000
         conn.setRequestProperty("X-Key", key)
         try {
             val code = try {
@@ -51,7 +62,7 @@ class Api(host: String, val key: String) {
             }
             if (code == 401) throw ApiException("Неверный ключ")
             if (code != 200) throw ApiException("Ошибка сервера: $code")
-            return conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            return conn.inputStream.use { it.readBytes() }
         } finally {
             conn.disconnect()
         }
@@ -73,5 +84,8 @@ class Api(host: String, val key: String) {
             val host = p.getString("host", null) ?: return null
             return Api(host, p.getString("key", "") ?: "")
         }
+
+        fun group(episodes: List<Episode>): List<Anime> =
+            episodes.groupBy { it.folder }.map { (name, eps) -> Anime(name, eps) }
     }
 }
