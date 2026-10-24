@@ -855,6 +855,9 @@ class App(tk.Tk):
         cmd += ["--translator", self._translator()]
         if local:
             cmd += ["--local-model", self.cfg["local_model"]]
+        if self._needs_translation():
+            self.log("Переводчик: " + (f"локально, {self.cfg['local_model']}" if local
+                                       else "Claude") + "\n")
         if until:
             cmd += ["--until", until]
             title, done = "Распознавание и перевод", self.open_editor
