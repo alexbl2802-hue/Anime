@@ -4,6 +4,7 @@ AnimeDub — оконная программа для дубляжа аниме 
 Сам .exe лёгкий: при первом запуске он ставит Python-окружение с нейросетями
 в %LOCALAPPDATA%\\AnimeDub и дальше запускает конвейер dub.py оттуда.
 """
+import collections
 import json
 import os
 import queue
@@ -48,6 +49,7 @@ STAGE_RU = {"extract": "Извлечение звука", "separate": "Отде�
             "synth": "Озвучка", "mix": "Сведение"}
 GPU_CHECK = ("import torch;ok=torch.cuda.is_available();print('Видеокарта:', "
              "torch.cuda.get_device_name(0) if ok else 'не найдена — работа пойдёт на процессоре (медленно)')")
+PY_CHECK = "import sys,struct;print(sys.version_info[1], struct.calcsize('P') * 8)"
 TQDM_RE = re.compile(r"\d+%\|")
 PIP_PROGRESS_RE = re.compile(r"^Progress (\d+) of (\d+)$")
 PIP_DOWNLOAD_RE = re.compile(r"^Downloading (\S+)")
@@ -88,15 +90,49 @@ def find_python():
              [str(local / "Programs" / "Python" / "Python311" / "python.exe")],
              ["python"]]
     for c in cands:
-        try:
-            r = subprocess.run(c + ["-c", "import sys;print(sys.version_info[1])"],
-                               capture_output=True, text=True, timeout=30,
-                               creationflags=NO_WINDOW, env=child_env())
-            if r.returncode == 0 and r.stdout.strip() in ("10", "11", "12"):
-                return c
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        if python_ok(c):
+            return c
     return None
+
+
+def python_ok(cmd):
+    """PyTorch 2.5.1 есть только для 64-битного Python 3.10–3.12."""
+    try:
+        r = subprocess.run(cmd + ["-c", PY_CHECK], capture_output=True, text=True, timeout=30,
+                           creationflags=NO_WINDOW, env=child_env())
+        return r.returncode == 0 and r.stdout.split() in (["10", "64"], ["11", "64"], ["12", "64"])
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def explain_failure(tail):
+    """Понятная причина ошибки pip/Python по последним строкам вывода."""
+    text = "\n".join(tail)
+    low = text.lower()
+    rules = [
+        (("no space left", "errno 28", "not enough space"),
+         "На диске закончилось место. Для установки нужно около 15 ГБ свободного места на диске C:."),
+        (("no matching distribution", "could not find a version"),
+         "Не удалось найти пакет. Чаще всего не открывается сайт download.pytorch.org — проверь "
+         "интернет, выключи VPN/прокси или разреши AnimeDub в антивирусе. Если не поможет, удали "
+         "папку %LOCALAPPDATA%\\AnimeDub\\venv и снова нажми «Установить компоненты»."),
+        (("readtimeout", "timed out", "connection reset", "connectionerror", "incompleteread",
+          "remote end closed", "max retries exceeded", "connection broken"),
+         "Оборвалось соединение при скачивании. Нажми «Установить компоненты» ещё раз — "
+         "уже скачанное повторно качаться не будет."),
+        (("winerror 5", "access is denied", "отказано в доступе", "permission denied"),
+         "Нет доступа к файлу. Закрой другие копии AnimeDub; если не поможет — добавь папку "
+         "%LOCALAPPDATA%\\AnimeDub в исключения антивируса."),
+        (("winerror 126", "winerror 127", "fbgemm.dll", "c10.dll"),
+         "Не хватает компонента Windows Microsoft Visual C++ Redistributable. Установи его с "
+         "https://aka.ms/vs/17/release/vc_redist.x64.exe и снова нажми «Установить компоненты»."),
+        (("hash", "do not match"),
+         "Скачанный файл повреждён. Нажми «Установить компоненты» ещё раз."),
+    ]
+    for keys, msg in rules:
+        if any(k in low for k in keys):
+            return msg
+    return ""
 
 
 def mb(n):
@@ -206,7 +242,9 @@ class App(tk.Tk):
                                 command=lambda: self.start_dub(None))
         self.b_stop = ttk.Button(btns, text="Стоп", command=self.stop, state="disabled")
         self.b_open = ttk.Button(btns, text="Открыть папку", command=self.open_folder)
-        for b in (self.b_setup, self.b_tr, self.b_ed, self.b_dub, self.b_stop, self.b_open):
+        self.b_copy = ttk.Button(btns, text="Скопировать журнал", command=self.copy_log)
+        for b in (self.b_setup, self.b_tr, self.b_ed, self.b_dub, self.b_stop, self.b_open,
+                  self.b_copy):
             b.pack(side="left", padx=3)
 
         st = ttk.Frame(self)
@@ -235,6 +273,11 @@ class App(tk.Tk):
             self.logbox.delete("1.0", "1000.0")
         self.logbox.see("end")
         self.logbox.configure(state="disabled")
+
+    def copy_log(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.logbox.get("1.0", "end-1c"))
+        self.set_status("Журнал скопирован — вставь его в сообщение (Ctrl+V)")
 
     def set_status(self, text, pct=None):
         self.status.configure(text=text)
@@ -332,14 +375,24 @@ class App(tk.Tk):
                 env=child_env(self.cfg.get("api_key", "")), creationflags=NO_WINDOW)
         except FileNotFoundError:
             raise StepFailed(f"Не найдена программа «{cmd[0]}».")
+        tail = collections.deque(maxlen=80)
         for line in self.proc.stdout:
             self.q.put(("line", line))
+            if not line.startswith("Progress "):
+                tail.append(line.rstrip())
         rc = self.proc.wait()
         self.proc = None
         if self.stopping:
             raise StepFailed("Остановлено")
         if rc != 0:
-            raise StepFailed(f"Этап «{title}» завершился с ошибкой (код {rc}). Подробности в журнале.")
+            errors = [l.strip() for l in tail if l.lstrip().startswith(("ERROR", "error:"))]
+            msg = f"Этап «{title}» завершился с ошибкой (код {rc})."
+            reason = explain_failure(tail)
+            if reason:
+                msg += "\n\n" + reason
+            if errors:
+                msg += "\n\nСообщение: " + errors[-1][:300]
+            raise StepFailed(msg + "\n\nПолный текст — кнопка «Скопировать журнал».")
 
     def run_task(self, fn, on_success=None):
         self.stopping = False
@@ -504,7 +557,15 @@ class App(tk.Tk):
 
     def _setup(self):
         APP_DIR.mkdir(parents=True, exist_ok=True)
-        pip = [str(VPY), "-m", "pip", "install", "--disable-pip-version-check"]
+        free = shutil.disk_usage(APP_DIR).free
+        if free < 15 * 2**30 and not self.cfg.get("installed"):
+            raise StepFailed(f"На диске свободно {mb(free)}, а для установки нужно около 15 ГБ. "
+                             "Освободи место и нажми «Установить компоненты» ещё раз.")
+        if VPY.exists() and not python_ok([str(VPY)]):
+            self.q.put(("log", "Окружение создано неподходящим Python — пересоздаю.\n"))
+            shutil.rmtree(VENV, ignore_errors=True)
+        pip = [str(VPY), "-m", "pip", "install", "--disable-pip-version-check",
+               "--timeout", "60", "--retries", "10"]
         py = find_python()
         has_ffmpeg = (shutil.which("ffmpeg", path=child_env()["PATH"])
                       and shutil.which("ffprobe", path=child_env()["PATH"]))
@@ -521,10 +582,11 @@ class App(tk.Tk):
             ("Обновление pip", 2, lambda: self._stream(
                 "Обновление pip", pip + ["--progress-bar", "off", "--upgrade", "pip"])),
             ("PyTorch с поддержкой видеокарты (~3 ГБ)", 45, lambda: self._stream(
-                "PyTorch", pip + ["--progress-bar", "raw"] + TORCH_PINS
+                "PyTorch", pip + ["--progress-bar", "raw", "--resume-retries", "10"] + TORCH_PINS
                 + ["--index-url", TORCH_INDEX])),
             ("Нейросети и библиотеки", 40, lambda: self._stream(
-                "Нейросети и библиотеки", pip + ["--progress-bar", "raw"] + REQS + TORCH_PINS
+                "Нейросети и библиотеки", pip + ["--progress-bar", "raw", "--resume-retries", "10"]
+                + REQS + TORCH_PINS
                 + ["--extra-index-url", TORCH_INDEX])),
             ("Проверка видеокарты", 3, lambda: self._stream(
                 "Проверка видеокарты", [str(VPY), "-c", GPU_CHECK])),
