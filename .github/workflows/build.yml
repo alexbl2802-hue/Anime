@@ -1,0 +1,37 @@
+name: Сборка AnimeDub.exe
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Установка PyInstaller
+        run: pip install pyinstaller==6.11.1
+
+      - name: Сборка exe
+        run: pyinstaller --noconfirm --onefile --windowed --name AnimeDub --add-data "dub.py;." app.py
+
+      - name: Загрузка как артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnimeDub
+          path: dist/AnimeDub.exe
+
+      - name: Публикация релиза
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/AnimeDub.exe
