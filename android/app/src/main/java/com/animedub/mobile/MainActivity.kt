@@ -206,6 +206,12 @@ class MainActivity : Activity() {
         })
         drawerHost = Ui.text(this, api?.base ?: "", 13f, 0xCCFFFFFF.toInt())
         head.addView(drawerHost)
+        val version = try {
+            packageManager.getPackageInfo(packageName, 0).versionName
+        } catch (e: Exception) {
+            null
+        }
+        if (version != null) head.addView(Ui.text(this, "Версия $version", 12f, 0x99FFFFFF.toInt()))
         panel.addView(head)
 
         fun item(icon: Int, label: String, action: () -> Unit) = LinearLayout(this).apply {
