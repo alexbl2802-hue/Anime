@@ -12,7 +12,11 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
+import urllib.error
+import urllib.request
+import zipfile
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -23,6 +27,13 @@ APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME
 VENV = APP_DIR / "venv"
 VPY = VENV / "Scripts" / "python.exe"
 CONFIG = APP_DIR / "config.json"
+PY_DIR = APP_DIR / "python311"
+FFMPEG_DIR = APP_DIR / "ffmpeg"
+PY_URLS = ["https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"]
+FFMPEG_URLS = [
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+]
 TORCH_INDEX = "https://download.pytorch.org/whl/cu124"
 TORCH_PINS = ["torch==2.5.1", "torchaudio==2.5.1"]  # новее ломают demucs (torch.load) и torchaudio.load
 REQS = ["coqui-tts", "faster-whisper", "demucs", "anthropic", "soundfile", "librosa"]
@@ -38,6 +49,8 @@ STAGE_RU = {"extract": "Извлечение звука", "separate": "Отде�
 GPU_CHECK = ("import torch;ok=torch.cuda.is_available();print('Видеокарта:', "
              "torch.cuda.get_device_name(0) if ok else 'не найдена — работа пойдёт на процессоре (медленно)')")
 TQDM_RE = re.compile(r"\d+%\|")
+PIP_PROGRESS_RE = re.compile(r"^Progress (\d+) of (\d+)$")
+PIP_DOWNLOAD_RE = re.compile(r"^Downloading (\S+)")
 
 
 class StepFailed(Exception):
@@ -59,7 +72,7 @@ def dub_script():
 def child_env(api_key=""):
     env = os.environ.copy()
     local = os.environ.get("LOCALAPPDATA", "")
-    extra = [str(Path(local) / "Microsoft" / "WinGet" / "Links"),
+    extra = [str(FFMPEG_DIR / "bin"), str(Path(local) / "Microsoft" / "WinGet" / "Links"),
              str(Path(local) / "Programs" / "Python" / "Launcher")]
     env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
     env.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1",
@@ -71,7 +84,7 @@ def child_env(api_key=""):
 
 def find_python():
     local = Path(os.environ.get("LOCALAPPDATA", ""))
-    cands = [["py", "-3.11"], ["py", "-3.12"], ["py", "-3.10"],
+    cands = [[str(PY_DIR / "python.exe")], ["py", "-3.11"], ["py", "-3.12"], ["py", "-3.10"],
              [str(local / "Programs" / "Python" / "Python311" / "python.exe")],
              ["python"]]
     for c in cands:
@@ -84,6 +97,10 @@ def find_python():
         except (OSError, subprocess.TimeoutExpired):
             pass
     return None
+
+
+def mb(n):
+    return f"{n / 2**30:.2f} ГБ" if n >= 2**30 else f"{n / 2**20:.0f} МБ"
 
 
 def load_cfg():
@@ -114,6 +131,8 @@ class App(tk.Tk):
         self.q = queue.Queue()
         self.proc = None
         self.stopping = False
+        self.step = None  # (заголовок, начало, доля) текущего шага установки
+        self.dl_name = ""
         self.phone = None
         self._build()
         if self.phone_on.get():
@@ -351,12 +370,19 @@ class App(tk.Tk):
                     self._handle_line(data)
                 elif kind == "log":
                     self.log(data)
+                elif kind == "step":
+                    self.step, self.dl_name = data, ""
+                    self._show_progress(0)
+                elif kind == "progress":
+                    self._show_progress(*data)
                 elif kind == "done":
+                    self.step = None
                     self._set_busy(False)
                     self.set_status("Готово", 100)
                     if data:
                         data()
                 elif kind == "fail":
+                    self.step = None
                     self._set_busy(False)
                     self.set_status("Ошибка" if data != "Остановлено" else "Остановлено")
                     self.log(f"\n✖ {data}\n")
@@ -366,8 +392,27 @@ class App(tk.Tk):
             pass
         self.after(100, self._poll)
 
+    def _show_progress(self, frac, detail=""):
+        """Прогресс шага установки -> общий процент установки."""
+        if not self.step:
+            return
+        title, start, span = self.step
+        total = start + span * min(max(frac, 0), 1)
+        self.set_status(f"Установка {total:.0f}% — {title}" + (f": {detail}" if detail else ""),
+                        total)
+
     def _handle_line(self, line):
         s = line.rstrip()
+        m = PIP_PROGRESS_RE.match(s)
+        if m:
+            cur, size = int(m[1]), int(m[2])
+            if size:
+                self._show_progress(cur / size, f"{self.dl_name} — {cur * 100 // size}% "
+                                                f"({mb(cur)} из {mb(size)})")
+            return
+        m = PIP_DOWNLOAD_RE.match(s)
+        if m and self.step:
+            self.dl_name = m[1].split("/")[-1].split("-")[0]
         if s.startswith("@@PROGRESS"):
             _, stage, cur, total = s.split()
             total = max(int(total), 1)
@@ -393,29 +438,107 @@ class App(tk.Tk):
         self.run_task(self._setup, lambda: messagebox.showinfo(
             APP_NAME, "Всё установлено! Можно выбирать серию."))
 
+    def _download(self, urls, dest):
+        """Скачивание с процентами; при ошибке пробует следующее зеркало."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part = dest.with_name(dest.name + ".part")
+        last = None
+        for url in urls:
+            self.q.put(("log", f"Скачивание {url}\n"))
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+                with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as f:
+                    size = int(r.headers.get("Content-Length") or 0)
+                    done, shown = 0, 0.0
+                    while True:
+                        if self.stopping:
+                            raise StepFailed("Остановлено")
+                        buf = r.read(1 << 18)
+                        if not buf:
+                            break
+                        f.write(buf)
+                        done += len(buf)
+                        if time.monotonic() - shown > 0.3:
+                            shown = time.monotonic()
+                            detail = (f"{done * 100 // size}% ({mb(done)} из {mb(size)})" if size
+                                      else mb(done))
+                            self.q.put(("progress", (done / size if size else 0, detail)))
+                if size and done < size:
+                    raise OSError(f"файл скачан не полностью ({mb(done)} из {mb(size)})")
+                part.replace(dest)
+                return
+            except (urllib.error.URLError, OSError) as e:
+                last = e
+                self.q.put(("log", f"Не получилось: {e}\n"))
+        raise StepFailed(f"Не удалось скачать {dest.name}: {last}. Проверь интернет и попробуй снова.")
+
+    def _install_python(self):
+        exe = APP_DIR / "python-3.11.9-amd64.exe"
+        self._download(PY_URLS, exe)
+        self.q.put(("progress", (0.5, "установка без окон, около минуты")))
+        self._stream("Установка Python 3.11",
+                     [str(exe), "/quiet", "InstallAllUsers=0", f"TargetDir={PY_DIR}",
+                      "Include_launcher=0", "Include_test=0", "Include_doc=0",
+                      "PrependPath=0", "Shortcuts=0", "AssociateFiles=0"])
+        exe.unlink(missing_ok=True)
+
+    def _install_ffmpeg(self):
+        z = APP_DIR / "ffmpeg.zip"
+        self._download(FFMPEG_URLS, z)
+        self.q.put(("progress", (1, "распаковка")))
+        try:
+            with zipfile.ZipFile(z) as arc:
+                names = [n for n in arc.namelist()
+                         if n.lower().endswith(("/bin/ffmpeg.exe", "/bin/ffprobe.exe"))]
+                if len(names) < 2:
+                    raise StepFailed("В архиве ffmpeg нет ffmpeg.exe и ffprobe.exe.")
+                (FFMPEG_DIR / "bin").mkdir(parents=True, exist_ok=True)
+                for n in names:
+                    with arc.open(n) as src, open(FFMPEG_DIR / "bin" / Path(n).name, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+        except zipfile.BadZipFile:
+            raise StepFailed("Архив ffmpeg повреждён. Нажми «Установить компоненты» ещё раз.")
+        finally:
+            z.unlink(missing_ok=True)
+        self.q.put(("log", f"ffmpeg установлен в {FFMPEG_DIR / 'bin'}\n"))
+
     def _setup(self):
         APP_DIR.mkdir(parents=True, exist_ok=True)
-        winget = ["winget", "install", "-e", "--silent",
-                  "--accept-package-agreements", "--accept-source-agreements", "--id"]
+        pip = [str(VPY), "-m", "pip", "install", "--disable-pip-version-check"]
         py = find_python()
+        has_ffmpeg = (shutil.which("ffmpeg", path=child_env()["PATH"])
+                      and shutil.which("ffprobe", path=child_env()["PATH"]))
+        # (заголовок, вес в общем проценте, действие); вес ~ время шага
+        steps = []
         if not py:
-            self._stream("Установка Python 3.11", winget + ["Python.Python.3.11"])
-            py = find_python()
-            if not py:
-                raise StepFailed("Python установлен, но пока не виден. Перезапусти AnimeDub "
-                                 "и снова нажми «Установить компоненты».")
-        if not shutil.which("ffmpeg", path=child_env()["PATH"]):
-            self._stream("Установка ffmpeg", winget + ["Gyan.FFmpeg"])
+            steps.append(("Python 3.11 (~25 МБ)", 3, self._install_python))
+        if not has_ffmpeg:
+            steps.append(("ffmpeg (~100 МБ)", 5, self._install_ffmpeg))
         if not VPY.exists():
-            self._stream("Создание окружения", py + ["-m", "venv", str(VENV)])
-        pip = [str(VPY), "-m", "pip", "install", "--disable-pip-version-check",
-               "--progress-bar", "off"]
-        self._stream("Обновление pip", pip + ["--upgrade", "pip"])
-        self._stream("PyTorch с поддержкой видеокарты (~3 ГБ)",
-                     pip + TORCH_PINS + ["--index-url", TORCH_INDEX])
-        self._stream("Нейросети и библиотеки",
-                     pip + REQS + TORCH_PINS + ["--extra-index-url", TORCH_INDEX])
-        self._stream("Проверка видеокарты", [str(VPY), "-c", GPU_CHECK])
+            steps.append(("Создание окружения", 2, lambda: self._stream(
+                "Создание окружения", (find_python() or []) + ["-m", "venv", str(VENV)])))
+        steps += [
+            ("Обновление pip", 2, lambda: self._stream(
+                "Обновление pip", pip + ["--progress-bar", "off", "--upgrade", "pip"])),
+            ("PyTorch с поддержкой видеокарты (~3 ГБ)", 45, lambda: self._stream(
+                "PyTorch", pip + ["--progress-bar", "raw"] + TORCH_PINS
+                + ["--index-url", TORCH_INDEX])),
+            ("Нейросети и библиотеки", 40, lambda: self._stream(
+                "Нейросети и библиотеки", pip + ["--progress-bar", "raw"] + REQS + TORCH_PINS
+                + ["--extra-index-url", TORCH_INDEX])),
+            ("Проверка видеокарты", 3, lambda: self._stream(
+                "Проверка видеокарты", [str(VPY), "-c", GPU_CHECK])),
+        ]
+        total = sum(w for _, w, _ in steps)
+        done = 0
+        for n, (title, weight, action) in enumerate(steps, 1):
+            label = f"шаг {n} из {len(steps)}, {title}"
+            self.q.put(("step", (label, done * 100 / total, weight * 100 / total)))
+            if not py and title.startswith("Создание") and not find_python():
+                raise StepFailed("Python установлен, но не запускается. Перезапусти AnimeDub "
+                                 "и снова нажми «Установить компоненты».")
+            action()
+            done += weight
         self.cfg["installed"] = True
         save_cfg(self.cfg)
 
