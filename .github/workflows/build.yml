@@ -1,8 +1,9 @@
-name: Сборка AnimeDub.exe
+name: Сборка AnimeDub
 
-# Собирается сама при каждом изменении кода; готовый exe публикуется в Releases.
-# Постоянная ссылка на последнюю сборку:
+# Собирается сама при каждом изменении кода; готовые exe и apk публикуются в Releases.
+# Постоянные ссылки на последнюю сборку:
 #   https://github.com/<владелец>/<репозиторий>/releases/latest/download/AnimeDub.exe
+#   https://github.com/<владелец>/<репозиторий>/releases/latest/download/AnimeDub.apk
 on:
   push:
     branches: ["**"]
@@ -18,7 +19,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +27,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Проверка модулей
+        run: python -c "import app, server, dub"
 
       - name: Установка PyInstaller
         run: pip install pyinstaller==6.11.1
@@ -36,11 +40,46 @@ jobs:
       - name: Упаковка в zip
         run: Compress-Archive -Path dist/AnimeDub.exe -DestinationPath dist/AnimeDub.zip
 
-      - name: Загрузка как артефакт
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: AnimeDub
-          path: dist/AnimeDub.exe
+          name: windows
+          path: |
+            dist/AnimeDub.exe
+            dist/AnimeDub.zip
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Сборка apk
+        run: gradle -p android assembleRelease --no-daemon --stacktrace
+
+      - name: Переименование
+        run: mkdir -p dist && cp android/app/build/outputs/apk/release/app-release.apk dist/AnimeDub.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/AnimeDub.apk
+
+  release:
+    needs: [windows, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Публикация релиза
         uses: softprops/action-gh-release@v2
@@ -53,3 +92,4 @@ jobs:
           files: |
             dist/AnimeDub.exe
             dist/AnimeDub.zip
+            dist/AnimeDub.apk

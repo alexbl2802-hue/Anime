@@ -16,6 +16,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from server import PORT, PhoneServer, addresses, new_key
+
 APP_NAME = "AnimeDub"
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME
 VENV = APP_DIR / "venv"
@@ -106,13 +108,16 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("AnimeDub — дубляж аниме голосами персонажей")
-        self.geometry("860x720")
+        self.geometry("860x760")
         self.minsize(720, 600)
         self.cfg = load_cfg()
         self.q = queue.Queue()
         self.proc = None
         self.stopping = False
+        self.phone = None
         self._build()
+        if self.phone_on.get():
+            self._phone_toggle()
         self.after(100, self._poll)
         if not self.cfg.get("installed"):
             self.log("Первый запуск: нажми «Установить компоненты».\n"
@@ -159,6 +164,18 @@ class App(tk.Tk):
         ttk.Scale(gains, from_=0.3, to=2.0, variable=self.vgain, length=150).pack(side="left")
         ttk.Label(gains, text="   музыка/фон").pack(side="left", padx=4)
         ttk.Scale(gains, from_=0.3, to=2.0, variable=self.bgain, length=150).pack(side="left")
+
+        ttk.Label(top, text="Телефон:").grid(row=5, column=0, sticky="nw", **pad)
+        phone = ttk.Frame(top)
+        phone.grid(row=5, column=1, columnspan=2, sticky="ew")
+        self.phone_on = tk.BooleanVar(value=self.cfg.get("phone", False))
+        ttk.Checkbutton(phone, text="Смотреть серии в приложении на Android",
+                        variable=self.phone_on, command=self._phone_toggle).pack(anchor="w", padx=6)
+        ttk.Button(phone, text="Добавить папку с сериями…",
+                   command=self.add_library).pack(anchor="w", padx=6, pady=2)
+        self.phone_info = tk.Text(phone, height=3, wrap="word", font=("Segoe UI", 9),
+                                  relief="flat", bg=self.cget("bg"), state="disabled")
+        self.phone_info.pack(fill="x", padx=6)
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=8, pady=4)
@@ -238,6 +255,51 @@ class App(tk.Tk):
                         last_ctx=ctx)
         save_cfg(self.cfg)
         return ctx
+
+    # --- доступ с телефона ---
+    def _library(self):
+        return list(self.cfg.get("library", []))
+
+    def _add_to_library(self, folder):
+        folder = str(Path(folder))
+        lib = self._library()
+        if folder not in lib:
+            self.cfg["library"] = lib + [folder]
+            save_cfg(self.cfg)
+
+    def add_library(self):
+        d = filedialog.askdirectory(title="Папка с готовыми сериями (*_dub_*.mkv)")
+        if d:
+            self._add_to_library(d)
+            self._phone_status()
+
+    def _phone_status(self, text=None):
+        if text is None:
+            if not self.phone:
+                text = "Выключено."
+            else:
+                addrs = addresses() or [("127.0.0.1", "только этот компьютер")]
+                text = ("Адрес: " + ", ".join(f"{ip}:{PORT} ({kind})" for ip, kind in addrs)
+                        + f"\nКлюч: {self.cfg['phone_key']}    Папок с сериями: {len(self._library())}")
+        self.phone_info.configure(state="normal")
+        self.phone_info.delete("1.0", "end")
+        self.phone_info.insert("1.0", text)
+        self.phone_info.configure(state="disabled")
+
+    def _phone_toggle(self):
+        if self.phone:
+            self.phone.stop()
+            self.phone = None
+        if self.phone_on.get():
+            key = self.cfg.setdefault("phone_key", new_key())
+            try:
+                self.phone = PhoneServer(key, self._library)
+            except OSError as e:
+                self.phone_on.set(False)
+                messagebox.showerror(APP_NAME, f"Не удалось открыть порт {PORT}: {e}")
+        self.cfg["phone"] = self.phone_on.get()
+        save_cfg(self.cfg)
+        self._phone_status()
 
     # --- запуск фоновых задач ---
     def _stream(self, title, cmd):
@@ -388,6 +450,7 @@ class App(tk.Tk):
         video = self.video.get()
         wd = work_dir(video)
         wd.mkdir(exist_ok=True)
+        self._add_to_library(Path(video).parent)
         self._ctx_file().write_text(ctx, encoding="utf-8")
         code = dict(LANGS)[self.lang.get()]
         cmd = [str(VPY), str(dub_script()), video, "--lang", code,
