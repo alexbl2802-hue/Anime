@@ -70,7 +70,9 @@ STAGE_RU = {"extract": "Извлечение звука", "separate": "Отде�
             "transcribe": "Распознавание речи", "translate": "Перевод",
             "synth": "Озвучка", "mix": "Сведение"}
 GPU_CHECK = ("import torch;ok=torch.cuda.is_available();print('Видеокарта:', "
-             "torch.cuda.get_device_name(0) if ok else 'не найдена — работа пойдёт на процессоре (медленно)')")
+             "f'{torch.cuda.get_device_name(0)}, "
+             "{torch.cuda.get_device_properties(0).total_memory / 2**30:.1f} ГБ' if ok "
+             "else 'не найдена — работа пойдёт на процессоре (медленно)')")
 PY_CHECK = "import sys,struct;print(sys.version_info[1], struct.calcsize('P') * 8)"
 TQDM_RE = re.compile(r"\d+%\|")
 PIP_PROGRESS_RE = re.compile(r"^Progress (\d+) of (\d+)$")
