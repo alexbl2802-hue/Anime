@@ -61,6 +61,42 @@ def setup_cuda_dlls():
         return "cpu"
 
 
+LOW_VRAM_GB = 6  # меньше — экономный режим (например, ноутбучная RTX 3050 на 4 ГБ)
+
+
+def vram_gb():
+    """Память видеокарты в ГБ (0 — видеокарты нет)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_properties(0).total_memory / 2**30
+    except Exception:
+        pass
+    return 0.0
+
+
+def low_vram():
+    v = vram_gb()
+    return 0 < v < LOW_VRAM_GB
+
+
+def free_gpu():
+    """Отдаём видеопамять следующему этапу."""
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def is_oom(e):
+    text = str(e).lower()
+    return "out of memory" in text or "cuda error" in text or "cublas" in text
+
+
 # ---------- 1. извлечение звука ----------
 def stage_extract(video, work):
     out = work / "audio.wav"
@@ -76,16 +112,32 @@ def sep_paths(work):
 
 def stage_separate(work):
     vocals, _ = sep_paths(work)
-    if not vocals.exists():
-        run([sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
-             "-o", work / "sep", work / "audio.wav"])
+    if vocals.exists():
+        return
+    cmd = [sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
+           "-o", work / "sep", work / "audio.wav"]
+    if low_vram():
+        cmd[4:4] = ["--segment", "7"]  # куски поменьше — меньше видеопамяти
+    try:
+        run(cmd)
+    except subprocess.CalledProcessError:
+        if setup_cuda_dlls() != "cuda":
+            raise
+        print("Не хватило видеопамяти для отделения голоса — продолжаю на процессоре "
+              "(это медленнее, 5–15 минут).", flush=True)
+        run(cmd[:4] + ["-d", "cpu"] + cmd[4:])
 
 
 # ---------- 3. распознавание ----------
 def transcribe_with(dev, vocals):
     from faster_whisper import WhisperModel
-    model = WhisperModel("large-v3", device=dev,
-                         compute_type="float16" if dev == "cuda" else "int8")
+    if dev != "cuda":
+        compute = "int8"
+    elif low_vram():
+        compute = "int8_float16"  # ~2 ГБ вместо ~4.5 ГБ, точность почти та же
+    else:
+        compute = "float16"
+    model = WhisperModel("large-v3", device=dev, compute_type=compute)
     segs, info = model.transcribe(str(vocals), language="ja", vad_filter=True, beam_size=5)
     lines = []
     for s in segs:
@@ -103,6 +155,10 @@ def stage_transcribe(work):
     if out.exists():
         return
     dev = setup_cuda_dlls()
+    if dev == "cuda":
+        v = vram_gb()
+        print(f"Видеопамять: {v:.1f} ГБ" + (" — экономный режим" if v < LOW_VRAM_GB else ""),
+              flush=True)
     vocals, _ = sep_paths(work)
     try:
         lines = transcribe_with(dev, vocals)
@@ -110,7 +166,9 @@ def stage_transcribe(work):
         if dev != "cuda":
             raise
         print(f"Whisper на видеокарте не запустился ({e}). Переключаюсь на процессор.", flush=True)
+        free_gpu()
         lines = transcribe_with("cpu", vocals)
+    free_gpu()
     save(out, lines)
 
 
@@ -435,12 +493,23 @@ def stage_synth(work, lang):
         ref = ref_dir / f"{l['id']:04d}.wav"
         if not make_ref(vocals, vsr, l, ref):
             continue
-        if tts is None:
-            print("Загрузка XTTS-v2 (при первом запуске скачивается ~2 ГБ)...", flush=True)
-            tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(dev)
         print(f"[{l['id']}] {l['tr']}", flush=True)
-        tts.tts_to_file(text=l["tr"], speaker_wav=str(ref),
-                        language=XTTS_LANG.get(lang, lang), file_path=str(wav))
+        for attempt in (1, 2):
+            try:
+                if tts is None:
+                    print("Загрузка XTTS-v2 (при первом запуске скачивается ~2 ГБ)...", flush=True)
+                    free_gpu()
+                    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(dev)
+                tts.tts_to_file(text=l["tr"], speaker_wav=str(ref),
+                                language=XTTS_LANG.get(lang, lang), file_path=str(wav))
+                break
+            except RuntimeError as e:
+                if dev != "cuda" or attempt == 2 or not is_oom(e):
+                    raise
+                print("Не хватило видеопамяти для озвучки — продолжаю на процессоре "
+                      "(медленнее, но уже озвученное сохранено).", flush=True)
+                tts, dev = None, "cpu"
+                free_gpu()
         txt.write_text(l["tr"], encoding="utf-8")
 
 
