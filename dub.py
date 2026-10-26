@@ -33,10 +33,24 @@ def progress(stage, cur, total):
     print(f"@@PROGRESS {stage} {int(cur)} {int(total)}", flush=True)
 
 
+NAMES = {"ffmpeg": "ffmpeg (работа с видео)", "demucs": "отделение голоса от музыки"}
+
+
+class StepError(RuntimeError):
+    """Понятная причина сбоя для журнала и телефона (вместо длинной технической строки)."""
+
+
 def run(cmd):
     cmd = [str(c) for c in cmd]
     print(">", " ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        prog = cmd[2] if cmd[1:2] == ["-m"] else Path(cmd[0]).stem
+        raise StepError(f"Ошибка: {NAMES.get(prog, prog)} завершилось с кодом {e.returncode}. "
+                        "Подробности — в журнале выше.") from None
+    except FileNotFoundError:
+        raise StepError(f"Ошибка: не найдена программа {cmd[0]}.") from None
 
 
 def load(p):
@@ -120,7 +134,7 @@ def stage_separate(work):
         cmd[4:4] = ["--segment", "7"]  # куски поменьше — меньше видеопамяти
     try:
         run(cmd)
-    except subprocess.CalledProcessError:
+    except StepError:
         if setup_cuda_dlls() != "cuda":
             raise
         print("Не хватило видеопамяти для отделения голоса — продолжаю на процессоре "
@@ -629,4 +643,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except StepError as e:
+        print(e, flush=True)
+        sys.exit(1)
