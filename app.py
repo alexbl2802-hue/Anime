@@ -21,6 +21,7 @@ import zipfile
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from jobs import Jobs
 from server import PORT, PhoneServer, Thumbs, addresses, new_key
 
 APP_NAME = "AnimeDub"
@@ -28,6 +29,7 @@ APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME
 VENV = APP_DIR / "venv"
 VPY = VENV / "Scripts" / "python.exe"
 CONFIG = APP_DIR / "config.json"
+UPLOADS = Path.home() / "Videos" / "AnimeDub"  # сюда кладутся видео, загруженные с телефона
 PY_DIR = APP_DIR / "python311"
 FFMPEG_DIR = APP_DIR / "ffmpeg"
 OLLAMA_URLS = ["https://ollama.com/download/OllamaSetup.exe",
@@ -234,6 +236,8 @@ class App(tk.Tk):
         self.step = None  # (заголовок, начало, доля) текущего шага установки
         self.dl_name = ""
         self.phone = None
+        self.jobs = None
+        self.busy = False
         self._build()
         if self.phone_on.get():
             self._phone_toggle()
@@ -360,6 +364,7 @@ class App(tk.Tk):
             self.bar.configure(value=pct)
 
     def _set_busy(self, busy):
+        self.busy = busy
         for b in (self.b_setup, self.b_tr, self.b_ed, self.b_dub):
             b.configure(state="disabled" if busy else "normal")
         self.b_stop.configure(state="normal" if busy else "disabled")
@@ -445,9 +450,14 @@ class App(tk.Tk):
             self.phone = None
         if self.phone_on.get():
             key = self.cfg.setdefault("phone_key", new_key())
+            if not self.jobs:
+                self.jobs = Jobs(self._library, self._phone_cmd,
+                                 lambda: child_env(self.cfg.get("api_key", "")),
+                                 lambda: self.busy, UPLOADS, self._add_to_library,
+                                 lambda text: self.q.put(("log", text + "\n")))
             try:
                 self.phone = PhoneServer(key, self._library, thumbs=Thumbs(
-                    APP_DIR / "thumbs", self._ffmpeg_dir))
+                    APP_DIR / "thumbs", self._ffmpeg_dir), jobs=self.jobs)
             except OSError as e:
                 self.phone_on.set(False)
                 messagebox.showerror(APP_NAME, f"Не удалось открыть порт {PORT}: {e}")
@@ -826,8 +836,46 @@ class App(tk.Tk):
         except (OSError, ValueError, KeyError):
             return True
 
+    def _dub_cmd(self, video, lang, until=None):
+        cfg = self.cfg
+        local = cfg.get("translator", "local") == "local"
+        ctx = work_dir(video) / "context.txt"
+        cmd = [str(VPY), str(dub_script()), video, "--lang", lang, "--context", str(ctx),
+               "--voice-gain", str(cfg.get("voice_gain", 1.0)),
+               "--bg-gain", str(cfg.get("bg_gain", 1.0)),
+               "--translator", "local" if local else "claude"]
+        if cfg.get("honorifics"):
+            cmd.append("--keep-honorifics")
+        if local:
+            cmd += ["--local-model", cfg.get("local_model", "qwen2.5:7b")]
+        if until:
+            cmd += ["--until", until]
+        return cmd
+
+    def _phone_cmd(self, video, lang):
+        """Команда для озвучки, запущенной с телефона: целиком, без редактора перевода."""
+        if not self.cfg.get("installed") or not VPY.exists():
+            raise RuntimeError("На компьютере не установлены компоненты — нажми там "
+                               "«Установить компоненты».")
+        local = self.cfg.get("translator", "local") == "local"
+        if local and not self.cfg.get("local_model"):
+            raise RuntimeError("На компьютере не установлен локальный переводчик — нажми там "
+                               "«Установить компоненты».")
+        if not local and not self.cfg.get("api_key"):
+            raise RuntimeError("На компьютере выбран Claude, но нет ключа. Выбери там "
+                               "«Локально — бесплатно» или впиши ключ.")
+        ctx = work_dir(video) / "context.txt"
+        if not ctx.exists():
+            ctx.parent.mkdir(exist_ok=True)
+            ctx.write_text(self.cfg.get("last_ctx", ""), encoding="utf-8")
+        return self._dub_cmd(video, lang)
+
     def start_dub(self, until):
         if not self._ready():
+            return
+        if self.jobs and self.jobs.busy():
+            messagebox.showwarning(APP_NAME, "Сейчас идёт озвучка, запущенная с телефона. "
+                                             "Дождись её окончания или отмени на телефоне.")
             return
         ctx = self._save_settings()
         local = self._translator() == "local"
@@ -845,21 +893,11 @@ class App(tk.Tk):
         wd.mkdir(exist_ok=True)
         self._add_to_library(Path(video).parent)
         self._ctx_file().write_text(ctx, encoding="utf-8")
-        code = dict(LANGS)[self.lang.get()]
-        cmd = [str(VPY), str(dub_script()), video, "--lang", code,
-               "--context", str(self._ctx_file()),
-               "--voice-gain", str(self.cfg["voice_gain"]),
-               "--bg-gain", str(self.cfg["bg_gain"])]
-        if self.honor.get():
-            cmd.append("--keep-honorifics")
-        cmd += ["--translator", self._translator()]
-        if local:
-            cmd += ["--local-model", self.cfg["local_model"]]
+        cmd = self._dub_cmd(video, dict(LANGS)[self.lang.get()], until)
         if self._needs_translation():
             self.log("Переводчик: " + (f"локально, {self.cfg['local_model']}" if local
                                        else "Claude") + "\n")
         if until:
-            cmd += ["--until", until]
             title, done = "Распознавание и перевод", self.open_editor
         else:
             title, done = "Дубляж", self._finished

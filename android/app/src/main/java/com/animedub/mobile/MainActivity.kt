@@ -4,7 +4,16 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import android.content.res.Configuration
+import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.provider.OpenableColumns
+import android.view.WindowManager
+import android.widget.ArrayAdapter
+import android.widget.CheckBox
+import android.widget.Spinner
+import android.widget.Toast
 import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
@@ -38,14 +47,26 @@ class Rows(
         bind(holder.itemView, items[position])
 }
 
+private const val PICK_VIDEO = 42
+
 class MainActivity : Activity() {
-    private enum class Screen { ALL, ANIME, HISTORY }
+    private enum class Screen { ALL, ANIME, HISTORY, DUB }
 
     private val bg = Executors.newSingleThreadExecutor()
     private var api: Api? = null
     private var episodes: List<Episode> = emptyList()
     private var screen = Screen.ALL
     private var opened: String? = null // открытое аниме (папка)
+
+    // экран «Озвучка»: состояние с компьютера и загрузка с телефона
+    private val handler = Handler(Looper.getMainLooper())
+    private var sources: List<Source> = emptyList()
+    private var jobs: List<Job> = emptyList()
+    private var dubError: String? = null
+    private var uploadText: String? = null
+    private var uploadFrac = 0f
+    private var finished = HashSet<String>()
+    private var dubScroll: ScrollView? = null
 
     private lateinit var drawer: DrawerLayout
     private lateinit var title: TextView
@@ -63,10 +84,17 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         // после плеера обновляем отметки «остановился на …»
-        if (::body.isInitialized && episodes.isNotEmpty()) render()
+        if (::body.isInitialized && (episodes.isNotEmpty() || screen == Screen.DUB)) render()
+        if (::body.isInitialized && screen == Screen.DUB) startPolling()
+    }
+
+    override fun onPause() {
+        handler.removeCallbacks(poll)
+        super.onPause()
     }
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
         bg.shutdownNow()
         super.onDestroy()
     }
@@ -228,6 +256,7 @@ class MainActivity : Activity() {
         }
         panel.addView(item(R.drawable.ic_grid, "Все аниме") { open(Screen.ALL) })
         panel.addView(item(R.drawable.ic_history, "История просмотра") { open(Screen.HISTORY) })
+        panel.addView(item(R.drawable.ic_voice, "Озвучка") { open(Screen.DUB) })
         panel.addView(View(this).apply { setBackgroundColor(Ui.SURFACE2) },
             LinearLayout.LayoutParams(-1, dp(1)).apply { setMargins(0, dp(8), 0, dp(8)) })
         panel.addView(item(R.drawable.ic_link, "Сменить компьютер") { showConnect() })
@@ -271,6 +300,10 @@ class MainActivity : Activity() {
             Screen.ALL -> renderAll()
             Screen.ANIME -> renderAnime()
             Screen.HISTORY -> renderHistory()
+            Screen.DUB -> {
+                renderDub()
+                startPolling()
+            }
         }
     }
 
@@ -475,6 +508,334 @@ class MainActivity : Activity() {
                 }
             }
         }, LinearLayoutManager(this)))
+    }
+
+    // ---------- озвучка на компьютере ----------
+    private val poll = object : Runnable {
+        override fun run() {
+            if (screen != Screen.DUB || isDestroyed) return
+            loadDub()
+            handler.postDelayed(this, 2500)
+        }
+    }
+
+    private fun startPolling() {
+        handler.removeCallbacks(poll)
+        handler.post(poll)
+    }
+
+    private fun loadDub() {
+        val a = api ?: return
+        bg.execute {
+            try {
+                val s = a.sources()
+                val j = a.jobs()
+                ui {
+                    sources = s
+                    jobs = j
+                    dubError = null
+                    // готовые серии сразу появятся в «Все аниме»
+                    val done = j.filter { it.state == "done" }.map { it.id }.toSet()
+                    if (!finished.containsAll(done)) {
+                        if (finished.isNotEmpty() || done.isNotEmpty()) load()
+                        finished = HashSet(done)
+                    }
+                    if (screen == Screen.DUB) renderDub()
+                }
+            } catch (e: Exception) {
+                val msg = e.message ?: e.toString()
+                ui {
+                    dubError = if (msg.contains("404")) "Обнови AnimeDub на компьютере — эта " +
+                        "версия не умеет озвучивать с телефона." else msg
+                    if (screen == Screen.DUB) renderDub()
+                }
+            }
+        }
+    }
+
+    private fun section(root: LinearLayout, text: String) {
+        root.addView(Ui.text(this, text, 17f, Ui.TEXT, true).apply {
+            setPadding(dp(6), dp(18), dp(6), dp(6))
+        })
+    }
+
+    private fun card(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = Ui.rounded(this@MainActivity, Ui.SURFACE, 14)
+        setPadding(dp(14), dp(12), dp(14), dp(12))
+        layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(4), 0, dp(4)) }
+    }
+
+    private fun renderDub() {
+        title.text = "Озвучка"
+        val keep = dubScroll?.scrollY ?: 0
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(4), dp(14), dp(32))
+        }
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Ui.rounded(this@MainActivity, Ui.ACCENT2, 18)
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+        }
+        head.addView(LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(ImageView(this@MainActivity).apply { setImageResource(R.drawable.mascot) },
+                LinearLayout.LayoutParams(dp(64), dp(64)))
+            addView(Ui.text(this@MainActivity, "Озвучка на компьютере", 18f, Ui.TEXT, true).apply {
+                setPadding(dp(12), 0, 0, 0)
+            })
+        })
+        head.addView(Ui.text(this, "Серии озвучиваются на видеокарте ноутбука. Приложение можно " +
+            "закрыть — работа продолжится, а готовая серия появится во «Все аниме».", 13f,
+            0xDDFFFFFF.toInt()).apply { setPadding(0, dp(8), 0, dp(12)) })
+        head.addView(Ui.pill(this, "＋ Загрузить видео с телефона", Ui.ACCENT).apply {
+            setOnClickListener { pickVideo() }
+        }, LinearLayout.LayoutParams(-2, -2))
+        root.addView(head)
+
+        uploadText?.let { t ->
+            root.addView(card().apply {
+                addView(Ui.text(this@MainActivity, t, 14f))
+                addView(Ui.progressBar(this@MainActivity, uploadFrac),
+                    LinearLayout.LayoutParams(-1, dp(4)).apply { topMargin = dp(8) })
+            })
+        }
+        dubError?.let { e ->
+            root.addView(card().apply { addView(Ui.text(this@MainActivity, e, 14f, Ui.ACCENT)) })
+        }
+
+        if (jobs.isNotEmpty()) {
+            section(root, "Задания")
+            for (j in jobs.take(10)) root.addView(jobCard(j))
+        }
+
+        section(root, "Серии на компьютере")
+        if (sources.isEmpty()) {
+            root.addView(Ui.text(this, if (dubError == null) "Загрузка…" else "Пока пусто. " +
+                "Загрузи видео с телефона или добавь папку с сериями в AnimeDub на компьютере.",
+                14f, Ui.SUB).apply { setPadding(dp(6), 0, dp(6), 0) })
+        }
+        val active = jobs.filter { it.active }.map { it.source }.toSet()
+        for ((folder, list) in sources.groupBy { it.folder }) {
+            root.addView(Ui.text(this, folder, 13f, Ui.ACCENT, true).apply {
+                setPadding(dp(6), dp(10), dp(6), dp(2))
+            })
+            for (src in list) root.addView(sourceRow(src, src.id in active))
+        }
+
+        val sv = ScrollView(this).apply {
+            isFillViewport = true
+            addView(root)
+        }
+        dubScroll = sv
+        setBody(sv)
+        sv.post { sv.scrollTo(0, keep) }
+    }
+
+    private fun stageName(stage: String) = when (stage) {
+        "extract" -> "Извлечение звука"
+        "separate" -> "Отделение голоса от музыки"
+        "transcribe" -> "Распознавание речи"
+        "translate" -> "Перевод"
+        "synth" -> "Озвучка голосами"
+        "mix" -> "Сведение"
+        else -> "Подготовка"
+    }
+
+    private fun jobCard(j: Job): View = card().apply {
+        addView(Ui.text(this@MainActivity, j.title, 15f, Ui.TEXT, true).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        val (state, color) = when (j.state) {
+            "queued" -> (j.message.ifEmpty { "В очереди" }) to Ui.SUB
+            "running" -> "${stageName(j.stage)} — ${j.percent}%" to Ui.TEXT
+            "done" -> "Готово ✓ Уже во «Все аниме»" to 0xFF7CE0A0.toInt()
+            "failed" -> "Ошибка: ${j.message}" to Ui.ACCENT
+            else -> "Отменено" to Ui.SUB
+        }
+        addView(Ui.text(this@MainActivity, "${j.folder} · ${j.lang.uppercase()} · $state", 13f, color)
+            .apply { setPadding(0, dp(2), 0, 0) })
+        if (j.state == "running" || j.state == "queued") {
+            addView(Ui.progressBar(this@MainActivity, j.percent / 100f),
+                LinearLayout.LayoutParams(-1, dp(4)).apply { topMargin = dp(8) })
+            addView(Ui.pill(this@MainActivity, "Отменить", Ui.SURFACE2).apply {
+                setOnClickListener {
+                    AlertDialog.Builder(this@MainActivity).setMessage("Отменить озвучку «${j.title}»?")
+                        .setPositiveButton("Отменить") { _, _ ->
+                            val a = api ?: return@setPositiveButton
+                            bg.execute {
+                                try {
+                                    a.cancel(j.id)
+                                } catch (e: Exception) {
+                                    ui { toast(e.message ?: e.toString()) }
+                                }
+                                ui { loadDub() }
+                            }
+                        }.setNegativeButton("Нет", null).show()
+                }
+            }, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(8) })
+        }
+    }
+
+    private fun sourceRow(src: Source, busy: Boolean): View = card().apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        val info = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+        info.addView(Ui.text(this@MainActivity, src.title, 15f, Ui.TEXT, true).apply {
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        val status = if (src.dubbed.isEmpty()) "Без озвучки · ${src.size / (1 shl 20)} МБ"
+        else "Озвучено: " + src.dubbed.joinToString { it.uppercase() } + " ✓"
+        info.addView(Ui.text(this@MainActivity, status, 12f, Ui.SUB))
+        addView(info, LinearLayout.LayoutParams(0, -2, 1f))
+        addView(Ui.pill(this@MainActivity, if (busy) "В работе" else "Озвучить",
+            if (busy) Ui.SURFACE2 else Ui.ACCENT).apply {
+            if (!busy) setOnClickListener { askDub(src.title) { lang, ctx -> startDub(src, lang, ctx) } }
+        })
+    }
+
+    private val langs = listOf("Русский" to "ru", "English" to "en", "Українська" to "uk",
+        "Español" to "es", "Deutsch" to "de", "Français" to "fr", "Italiano" to "it",
+        "Português" to "pt", "Polski" to "pl", "Türkçe" to "tr")
+
+    /** Диалог: язык и описание персонажей (+ имя аниме и «сразу озвучить» для загрузки). */
+    private fun askDub(
+        name: String, upload: Boolean = false,
+        onOk: (lang: String, ctx: String) -> Unit,
+    ) {
+        val p = Api.prefs(this)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
+        }
+        val folder = EditText(this).apply {
+            hint = "Название аниме (папка на компьютере)"
+            setSingleLine()
+            setText(p.getString("upload_folder", "С телефона"))
+        }
+        val now = CheckBox(this).apply {
+            text = "Сразу озвучить после загрузки"
+            isChecked = true
+        }
+        if (upload) {
+            box.addView(folder)
+            box.addView(now)
+        }
+        box.addView(Ui.text(this, "Язык озвучки", 13f, Ui.SUB).apply { setPadding(0, dp(10), 0, 0) })
+        val spinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                langs.map { it.first })
+            setSelection(langs.indexOfFirst { it.second == p.getString("dub_lang", "ru") }
+                .coerceAtLeast(0))
+        }
+        box.addView(spinner)
+        val ctx = EditText(this).apply {
+            hint = "Персонажи и манера речи (необязательно): «Харука — резкая, саркастичная…»"
+            minLines = 3
+            gravity = Gravity.TOP
+            setText(p.getString("dub_ctx", ""))
+        }
+        box.addView(ctx)
+        AlertDialog.Builder(this).setTitle(if (upload) "Загрузить «$name»" else "Озвучить «$name»")
+            .setView(ScrollView(this).apply { addView(box) })
+            .setPositiveButton(if (upload) "Загрузить" else "Озвучить") { _, _ ->
+                val lang = langs[spinner.selectedItemPosition].second
+                p.edit().putString("dub_lang", lang).putString("dub_ctx", ctx.text.toString())
+                    .putString("upload_folder", folder.text.toString())
+                    .putBoolean("upload_dub", now.isChecked).apply()
+                onOk(lang, ctx.text.toString().trim())
+            }
+            .setNegativeButton("Отмена", null).show()
+    }
+
+    private fun startDub(src: Source, lang: String, ctx: String) {
+        val a = api ?: return
+        bg.execute {
+            try {
+                a.startDub(src.id, lang, ctx)
+                ui {
+                    toast("«${src.title}» — в очереди на озвучку")
+                    loadDub()
+                }
+            } catch (e: Exception) {
+                ui { toast(e.message ?: e.toString()) }
+            }
+        }
+    }
+
+    private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
+
+    private fun pickVideo() {
+        if (uploadText != null) {
+            toast("Подожди, пока загрузится предыдущее видео")
+            return
+        }
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE).setType("video/*"), PICK_VIDEO)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val uri = data?.data
+        if (requestCode != PICK_VIDEO || resultCode != RESULT_OK || uri == null) return
+        var name = "Серия.mp4"
+        var size = -1L
+        contentResolver.query(uri, null, null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                val si = c.getColumnIndex(OpenableColumns.SIZE)
+                if (ni >= 0 && !c.isNull(ni)) name = c.getString(ni)
+                if (si >= 0 && !c.isNull(si)) size = c.getLong(si)
+            }
+        }
+        if (size <= 0) {
+            toast("Не удалось узнать размер файла — выбери видео из галереи или «Файлов»")
+            return
+        }
+        askDub(name, upload = true) { lang, ctx ->
+            val p = Api.prefs(this)
+            upload(uri, name, size, p.getString("upload_folder", "С телефона") ?: "С телефона",
+                p.getBoolean("upload_dub", true), lang, ctx)
+        }
+    }
+
+    private fun upload(uri: Uri, name: String, size: Long, folder: String, dub: Boolean,
+                       lang: String, ctx: String) {
+        val a = api ?: return
+        uploadText = "Загрузка «$name» на компьютер — 0%"
+        uploadFrac = 0f
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (screen == Screen.DUB) renderDub()
+        Thread {
+            val result = try {
+                val input = contentResolver.openInputStream(uri)
+                    ?: throw ApiException("Не удалось открыть файл")
+                input.use {
+                    a.upload(folder.ifBlank { "С телефона" }, name, size, it, dub, lang, ctx) { f ->
+                        ui {
+                            uploadFrac = f
+                            uploadText = "Загрузка «$name» на компьютер — ${(f * 100).toInt()}% " +
+                                "(${size / (1 shl 20)} МБ). Не закрывай приложение."
+                            if (screen == Screen.DUB) renderDub()
+                        }
+                    }
+                }
+                null
+            } catch (e: Exception) {
+                e.message ?: e.toString()
+            }
+            ui {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                uploadText = null
+                toast(result?.let { "Не загрузилось: $it" }
+                    ?: if (dub) "Загружено. Озвучка поставлена в очередь" else "Загружено на компьютер")
+                loadDub()
+                load()
+            }
+        }.start()
     }
 
     // ---------- воспроизведение ----------

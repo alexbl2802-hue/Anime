@@ -135,7 +135,78 @@ class Handler(BaseHTTPRequestHandler):
             if not item:
                 return self._json(404, {"error": "Серия не найдена"})
             return self._send_file(item)
+        jobs = self.server.jobs
+        if url.path in ("/api/sources", "/api/jobs") and not jobs:
+            return self._json(503, {"error": "Озвучка с телефона недоступна"})
+        if url.path == "/api/sources":
+            return self._json(200, jobs.source_list())
+        if url.path == "/api/jobs":
+            return self._json(200, jobs.list())
         return self._json(404, {"error": "Нет такого адреса"})
+
+    # ---------- озвучка с телефона ----------
+    def _body_json(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 1 << 20:
+            raise ValueError("Слишком большой запрос")
+        raw = self.rfile.read(n) if n else b"{}"
+        return json.loads(raw.decode("utf-8") or "{}")
+
+    def do_POST(self):
+        url = urllib.parse.urlsplit(self.path)
+        if not self._authorized(urllib.parse.parse_qs(url.query)):
+            self.close_connection = True
+            return self._json(401, {"error": "Неверный ключ"})
+        jobs = self.server.jobs
+        if not jobs:
+            self.close_connection = True
+            return self._json(503, {"error": "Озвучка с телефона недоступна"})
+        try:
+            data = self._body_json()
+        except ValueError as e:
+            self.close_connection = True
+            return self._json(400, {"error": str(e)})
+        if url.path == "/api/dub":
+            try:
+                job = jobs.start(str(data.get("id", "")), str(data.get("lang") or "ru")[:5],
+                                 str(data.get("context") or "")[:4000])
+            except KeyError as e:
+                return self._json(404, {"error": e.args[0]})
+            return self._json(200, job)
+        m = re.fullmatch(r"/api/jobs/([0-9a-f]+)/cancel", url.path)
+        if m:
+            return self._json(200, {"cancelled": jobs.cancel(m[1])})
+        return self._json(404, {"error": "Нет такого адреса"})
+
+    def do_PUT(self):
+        url = urllib.parse.urlsplit(self.path)
+        query = urllib.parse.parse_qs(url.query)
+        self.close_connection = True  # тело большое — после ответа соединение не переиспользуем
+        if not self._authorized(query):
+            return self._json(401, {"error": "Неверный ключ"})
+        jobs = self.server.jobs
+        if url.path != "/api/upload" or not jobs:
+            return self._json(404, {"error": "Нет такого адреса"})
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return self._json(411, {"error": "Нужен размер файла"})
+        q = {k: v[0] for k, v in query.items()}
+        try:
+            source = jobs.upload(q.get("folder", ""), q.get("name", ""), self.rfile, length)
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
+        except (ConnectionError, OSError) as e:
+            return self._json(500, {"error": f"Не удалось сохранить видео: {e}"})
+        result = {"id": source}
+        if q.get("dub") == "1":
+            try:
+                result["job"] = jobs.start(source, q.get("lang", "ru")[:5], q.get("context", ""))
+            except KeyError as e:
+                result["error"] = e.args[0]
+        return self._json(200, result)
 
     def _send_file(self, item):
         size = item["size"]
@@ -227,12 +298,13 @@ class Thumbs:
 class PhoneServer:
     """Сервер в фоновом потоке. folders — функция, возвращающая папки библиотеки."""
 
-    def __init__(self, key, folders, port=PORT, thumbs=None):
+    def __init__(self, key, folders, port=PORT, thumbs=None, jobs=None):
         self.httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
         self.httpd.daemon_threads = True
         self.httpd.key = key.lower()
         self.httpd.folders = folders
         self.httpd.thumb = thumbs or (lambda item: None)
+        self.httpd.jobs = jobs
         self.port = port
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
