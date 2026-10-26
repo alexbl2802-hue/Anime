@@ -59,7 +59,7 @@ TORCH_SOURCES = [("index", TORCH_INDEX),
                  ("links", "https://mirrors.aliyun.com/pytorch-wheels/cu124/"),
                  ("index", "https://mirrors.nju.edu.cn/pytorch/whl/cu124")]
 TORCH_PINS = ["torch==2.5.1", "torchaudio==2.5.1"]  # новее ломают demucs (torch.load) и torchaudio.load
-REQS = ["coqui-tts", "faster-whisper", "demucs", "anthropic", "soundfile", "librosa"]
+REQS = ["coqui-tts", "faster-whisper", "demucs==4.0.1", "anthropic", "soundfile", "librosa"]
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 CHARS_PER_SEC = 14
 

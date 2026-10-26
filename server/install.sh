@@ -58,7 +58,9 @@ else
     CPU_INDEX=""  # для ARM колёса PyTorch на PyPI и так без CUDA
     "$PY" -m pip install -q $PINS
 fi
-"$PY" -m pip install -q coqui-tts faster-whisper demucs soundfile librosa $PINS $CPU_INDEX
+# demucs 4.1 тянет sphn, которому под ARM нужна сборка на Rust — берём проверенную 4.0.1
+export CMAKE_POLICY_VERSION_MINIMUM=3.5  # на случай сборки из исходников с новым CMake
+"$PY" -m pip install -q coqui-tts faster-whisper demucs==4.0.1 soundfile librosa $PINS $CPU_INDEX
 "$PY" -c "import torch, faster_whisper, demucs, TTS; print('Нейросети на месте, PyTorch', torch.__version__)"
 
 say "5/7 Переводчик Ollama и модель $MODEL"
