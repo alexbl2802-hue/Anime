@@ -1,0 +1,39 @@
+name: Проверка AnimeDub-сервера
+
+# Ставит сервер скриптом install.sh на чистую Ubuntu (ARM, как бесплатный Oracle Cloud, и x86)
+# и проверяет, что он запускается и отвечает приложению.
+on:
+  push:
+    paths: ["server/**", "headless.py", "jobs.py", "server.py", "dub.py",
+            ".github/workflows/server.yml"]
+  workflow_dispatch:
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установка скриптом install.sh
+        env:
+          ANIMEDUB_BRANCH: ${{ github.ref_name }}
+          SKIP_MODEL: "1"
+          SKIP_SERVICE: "1"
+          SKIP_TAILSCALE: "1"
+        run: bash server/install.sh
+
+      - name: Сервер запускается и отвечает
+        run: |
+          export ANIMEDUB_HOME=$HOME/animedub
+          PY=$ANIMEDUB_HOME/venv/bin/python
+          $PY $ANIMEDUB_HOME/app/headless.py > server.log 2>&1 &
+          sleep 5
+          KEY=$($PY -c "import json;print(json.load(open('$ANIMEDUB_HOME/config.json'))['key'])")
+          curl -fsS -H "X-Key: $KEY" http://127.0.0.1:8765/api/info
+          curl -fsS -H "X-Key: $KEY" http://127.0.0.1:8765/api/sources
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/api/info)" = 401
+          cat server.log

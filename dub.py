@@ -129,6 +129,9 @@ def stage_separate(work):
 
 
 # ---------- 3. распознавание ----------
+WHISPER = "large-v3"
+
+
 def transcribe_with(dev, vocals):
     from faster_whisper import WhisperModel
     if dev != "cuda":
@@ -137,7 +140,15 @@ def transcribe_with(dev, vocals):
         compute = "int8_float16"  # ~2 ГБ вместо ~4.5 ГБ, точность почти та же
     else:
         compute = "float16"
-    model = WhisperModel("large-v3", device=dev, compute_type=compute)
+    try:
+        model = WhisperModel(WHISPER, device=dev, compute_type=compute,
+                             cpu_threads=os.cpu_count() or 4)
+    except (ValueError, RuntimeError, OSError) as e:
+        if WHISPER == "large-v3":
+            raise
+        print(f"Модель распознавания {WHISPER} недоступна ({e}), беру large-v3.", flush=True)
+        model = WhisperModel("large-v3", device=dev, compute_type=compute,
+                             cpu_threads=os.cpu_count() or 4)
     segs, info = model.transcribe(str(vocals), language="ja", vad_filter=True, beam_size=5)
     lines = []
     for s in segs:
@@ -575,6 +586,7 @@ def stage_mix(video, work, out_path, voice_gain, bg_gain):
 
 
 def main():
+    global WHISPER
     p = argparse.ArgumentParser(description="Дубляж аниме голосами персонажей")
     p.add_argument("video")
     p.add_argument("--lang", default="ru")
@@ -582,10 +594,18 @@ def main():
     p.add_argument("--keep-honorifics", action="store_true")
     p.add_argument("--translator", choices=["claude", "local"], default="claude")
     p.add_argument("--local-model", default=LOCAL_MODEL)
+    p.add_argument("--whisper", default=WHISPER,
+                   help="модель распознавания; на сервере без видеокарты — large-v3-turbo")
     p.add_argument("--until", choices=STAGES)
     p.add_argument("--voice-gain", type=float, default=1.0)
     p.add_argument("--bg-gain", type=float, default=1.0)
     a = p.parse_args()
+    WHISPER = a.whisper
+    try:  # на процессоре — все ядра
+        import torch
+        torch.set_num_threads(os.cpu_count() or 4)
+    except Exception:
+        pass
 
     video = Path(a.video)
     work = video.parent / f"work_{video.stem}"

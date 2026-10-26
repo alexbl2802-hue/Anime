@@ -14,6 +14,7 @@ import os
 import socket
 import subprocess
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,9 +27,10 @@ NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 KEY_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"  # без похожих символов: l/1, o/0
 
 
-def new_key():
-    k = "".join(secrets.choice(KEY_ALPHABET) for _ in range(8))
-    return f"{k[:4]}-{k[4:]}"
+def new_key(length=8):
+    """Ключ вида abcd-efgh; для сервера в интернете — длиннее (16 символов)."""
+    k = "".join(secrets.choice(KEY_ALPHABET) for _ in range(length))
+    return "-".join(k[i:i + 4] for i in range(0, length, 4))
 
 
 def file_id(path):
@@ -100,8 +102,19 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _authorized(self, query):
+        ip = self.client_address[0]
+        now = time.monotonic()
+        with self.server.fail_lock:
+            fails = [t for t in self.server.fails.get(ip, []) if now - t < 600]
+            self.server.fails[ip] = fails
+            if len(fails) >= 10:
+                return False  # слишком много неверных ключей — молчим 10 минут
         given = self.headers.get("X-Key") or query.get("k", [""])[0]
-        return hmac.compare_digest(given.strip().lower().encode(), self.server.key.encode())
+        ok = hmac.compare_digest(given.strip().lower().encode(), self.server.key.encode())
+        if not ok:
+            with self.server.fail_lock:
+                self.server.fails.setdefault(ip, []).append(now)
+        return ok
 
     def do_HEAD(self):
         self.do_GET()
@@ -305,6 +318,8 @@ class PhoneServer:
         self.httpd.folders = folders
         self.httpd.thumb = thumbs or (lambda item: None)
         self.httpd.jobs = jobs
+        self.httpd.fails = {}
+        self.httpd.fail_lock = threading.Lock()
         self.port = port
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 

@@ -582,11 +582,11 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             addView(ImageView(this@MainActivity).apply { setImageResource(R.drawable.mascot) },
                 LinearLayout.LayoutParams(dp(64), dp(64)))
-            addView(Ui.text(this@MainActivity, "Озвучка на компьютере", 18f, Ui.TEXT, true).apply {
+            addView(Ui.text(this@MainActivity, "Озвучка", 18f, Ui.TEXT, true).apply {
                 setPadding(dp(12), 0, 0, 0)
             })
         })
-        head.addView(Ui.text(this, "Серии озвучиваются на видеокарте ноутбука. Приложение можно " +
+        head.addView(Ui.text(this, "Серии озвучиваются на компьютере или сервере, к которому подключён телефон. Приложение можно " +
             "закрыть — работа продолжится, а готовая серия появится во «Все аниме».", 13f,
             0xDDFFFFFF.toInt()).apply { setPadding(0, dp(8), 0, dp(12)) })
         head.addView(Ui.pill(this, "＋ Загрузить видео с телефона", Ui.ACCENT).apply {
