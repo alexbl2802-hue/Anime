@@ -55,4 +55,5 @@ jobs:
           $PY $APP/dub.py ep.mp4 --lang ru --translator local --whisper tiny
           echo "Дорожки в готовом файле:"; ffprobe -v error -show_entries stream=codec_type:stream_tags=title -of csv=p=0 ep_dub_ru.mkv
           test "$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 ep_dub_ru.mkv | wc -l)" = 2
-          $PY -c "from faster_whisper import WhisperModel; m = WhisperModel('tiny', device='cpu', compute_type='int8'); s, _ = m.transcribe('voice.wav', condition_on_previous_text=False); print('Whisper:', ' '.join(x.text for x in s))"
+          # распознавание — тем же кодом, что и в программе (модель tiny для скорости)
+          $PY -c "import sys; sys.path.insert(0, '$APP'); import dub; dub.WHISPER = 'tiny'; print('Whisper:', dub.transcribe_with('cpu', 'voice.wav'))"

@@ -165,7 +165,10 @@ def transcribe_with(dev, vocals):
         model = WhisperModel("large-v3", device=dev, compute_type=compute,
                              cpu_threads=os.cpu_count() or 4)
     # condition_on_previous_text=False — Whisper не «зацикливается» на одной фразе
-    segs, info = model.transcribe(str(vocals), language="ja", vad_filter=True, beam_size=5,
+    # звук читаем сами: чтение файла внутри faster-whisper зависит от версии PyAV и ломается
+    import librosa
+    audio, _ = librosa.load(str(vocals), sr=16000, mono=True)
+    segs, info = model.transcribe(audio, language="ja", vad_filter=True, beam_size=5,
                                   condition_on_previous_text=False)
     raw = []
     for s in segs:
