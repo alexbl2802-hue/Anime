@@ -147,7 +147,7 @@ def stage_separate(work):
 WHISPER = "large-v3"
 
 
-def transcribe_with(dev, vocals):
+def transcribe_with(dev, vocals, hotwords=None):
     from faster_whisper import WhisperModel
     if dev != "cuda":
         compute = "int8"
@@ -168,8 +168,14 @@ def transcribe_with(dev, vocals):
     # звук читаем сами: чтение файла внутри faster-whisper зависит от версии PyAV и ломается
     import librosa
     audio, _ = librosa.load(str(vocals), sr=16000, mono=True)
-    segs, info = model.transcribe(audio, language="ja", vad_filter=True, beam_size=5,
-                                  condition_on_previous_text=False)
+    # VAD мягче обычного: в аниме много криков и речи поверх музыки
+    vad = {"threshold": 0.3, "min_silence_duration_ms": 500, "speech_pad_ms": 300}
+    extra = {}
+    if hotwords:  # имена из описания персонажей — Whisper будет писать их правильно
+        extra["hotwords"] = " ".join(hotwords)
+        extra["initial_prompt"] = "登場人物：" + "、".join(hotwords) + "。"
+    segs, info = model.transcribe(audio, language="ja", vad_filter=True, vad_parameters=vad,
+                                  beam_size=5, condition_on_previous_text=False, **extra)
     raw = []
     for s in segs:
         progress("transcribe", s.end, info.duration)
@@ -190,9 +196,12 @@ def _norm(text):
     return re.sub(r"[\s、。!！?？…・「」『』~〜ー-]", "", text)
 
 
+JA_RE = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]")
+
+
 def clean_lines(raw):
-    """Убираем фантомные фразы, зацикленные повторы и «речь» в тишине."""
-    out, dropped = [], 0
+    """Убираем фантомные фразы, зацикленные повторы, песни на английском и явный шум."""
+    out, dropped, why = [], 0, []
     i = 0
     while i < len(raw):
         seg = raw[i]
@@ -202,23 +211,73 @@ def clean_lines(raw):
             j += 1
         run = j - i + 1
         keep = [seg] if run >= 3 else raw[i:j + 1]
-        dropped += run - len(keep)
+        if run - len(keep):
+            dropped += run - len(keep)
+            why.append(f"повтор ×{run}: {seg['ja'][:40]}")
         for k in keep:
             text = _norm(k["ja"])
             phantom = any(_norm(p) in text for p in PHANTOMS) and len(text) <= 20
-            silent = k.get("no_speech", 0) > 0.6 and k.get("logprob", 0) < -1.0
-            if phantom or silent or not text:
+            # только явный шум: Whisper почти уверен, что речи нет, и сам текст «мусорный»
+            noise = k.get("no_speech", 0) > 0.85 and k.get("logprob", 0) < -1.3
+            song = not JA_RE.search(k["ja"]) and len(re.findall(r"[A-Za-z]", k["ja"])) >= 3
+            reason = ("фантом" if phantom else "шум" if noise else "песня" if song
+                      else "пусто" if not text else None)
+            if reason:
                 dropped += 1
+                why.append(f"{reason} [{k['start']:.0f} с]: {k['ja'][:40]}")
                 continue
             out.append({"id": len(out), "start": k["start"], "end": k["end"],
                         "ja": k["ja"], "tr": ""})
         i = j + 1
     if dropped:
-        print(f"Убрано лишних реплик (повторы и шум): {dropped}", flush=True)
+        print(f"Убрано лишних реплик: {dropped}", flush=True)
+        for w in why[:40]:
+            print("  — " + w, flush=True)
     return out
 
 
-def stage_transcribe(work):
+# ---------- кириллица -> катакана (для подсказки Whisper с именами) ----------
+def to_katakana(word):
+    """«Наруто» -> «ナルト». None, если слово не разбирается как японское имя."""
+    rev = {}
+    for kana, (_, cyr) in _KANA.items():
+        rev.setdefault(cyr, kana)
+        if "э" in cyr:
+            rev.setdefault(cyr.replace("э", "е"), kana)  # «Хокаге» = «Хокагэ»
+    for cons, kana in {"с": "ス", "к": "ク", "т": "ト", "ц": "ツ", "ф": "フ", "м": "ム",
+                       "н": "ン", "й": "イ", "п": "プ", "б": "ブ", "г": "グ", "д": "ド",
+                       "р": "ル", "х": "フ"}.items():
+        rev.setdefault(cons, kana)
+    w, out, i = word.lower().replace("ё", "ё"), [], 0
+    while i < len(w):
+        for size in (3, 2, 1):
+            part = w[i:i + size]
+            if part in rev:
+                if size == 1 and part == "н" and i + 1 < len(w) and w[i + 1] in "аиуэоеяюё":
+                    continue  # «на» и т.п. — не отдельная «ン»
+                out.append(rev[part])
+                i += size
+                break
+        else:
+            return None
+    return "".join(out) if len(out) >= 2 else None
+
+
+def context_names(ctx_file):
+    """Имена из описания персонажей: «Ирука — учитель…» -> [(«Ирука», «イルカ»)]."""
+    if not ctx_file or not Path(ctx_file).exists():
+        return []
+    names = []
+    for line in Path(ctx_file).read_text(encoding="utf-8").splitlines():
+        head = re.split(r"\s[—–-]\s|:", line, maxsplit=1)[0] if re.search(r"\s[—–-]\s|:", line) else ""
+        for word in re.findall(r"[А-ЯЁ][а-яё]+", head):
+            kana = to_katakana(word)
+            if kana and (word, kana) not in names:
+                names.append((word, kana))
+    return names[:20]
+
+
+def stage_transcribe(work, ctx_file=None):
     out = work / "lines.json"
     if out.exists():
         print(f"Речь уже распознана раньше — беру готовое. Чтобы распознать и перевести заново, "
@@ -230,14 +289,17 @@ def stage_transcribe(work):
         print(f"Видеопамять: {v:.1f} ГБ" + (" — экономный режим" if v < LOW_VRAM_GB else ""),
               flush=True)
     vocals, _ = sep_paths(work)
+    hot = [kana for _, kana in context_names(ctx_file)]
+    if hot:
+        print("Подсказка для распознавания (имена из описания): " + "、".join(hot), flush=True)
     try:
-        lines = transcribe_with(dev, vocals)
+        lines = transcribe_with(dev, vocals, hot)
     except (RuntimeError, OSError) as e:
         if dev != "cuda":
             raise
         print(f"Whisper на видеокарте не запустился ({e}). Переключаюсь на процессор.", flush=True)
         free_gpu()
-        lines = transcribe_with("cpu", vocals)
+        lines = transcribe_with("cpu", vocals, hot)
     free_gpu()
     save(out, lines)
 
@@ -439,10 +501,14 @@ def transliterate(text, lang):
     return " ".join(w[:1].upper() + w[1:] for w in word.split()) or None
 
 
-def bad_translation(line, tr, echo, lang):
+def bad_translation(line, tr, echo, lang, terms=()):
     """Причина, по которой перевод реплики не годится, или None."""
     if not tr.strip():
         return "пусто"
+    for t in terms:  # имя есть в оригинале — должно быть и в переводе (хотя бы основа слова)
+        stem = t["tr"].split()[0][:max(3, len(t["tr"].split()[0]) - 2)].lower()
+        if t["ja"] in line["ja"] and stem and stem not in tr.lower():
+            return f"имя «{t['tr']}» переведено неправильно или потеряно"
     if lang not in ("ja", "zh") and CJK_RE.search(tr):
         return "иероглифы в переводе"
     if lang in CYRILLIC and LATIN_RE.search(tr) and not LATIN_RE.search(line["ja"]):
@@ -453,6 +519,11 @@ def bad_translation(line, tr, echo, lang):
         if a and b and difflib.SequenceMatcher(None, a, b).ratio() < 0.5:
             return "перевод съехал на другую реплику"
     return None
+
+
+SHORTEN_PROMPT = """Ты — редактор дубляжа. Эти реплики слишком длинные: актёр не успеет их
+произнести. Сократи каждую до max_chars символов на языке «{lang}», сохранив смысл, эмоцию
+и имена. Верни для каждой её id, японский оригинал (ja) без изменений и сокращённый перевод (tr)."""
 
 
 def ollama_exe():
@@ -559,6 +630,17 @@ def build_glossary(work, lines, model, lang, ctx_file):
         elif CJK_RE.search(tr) or (lang in CYRILLIC and LATIN_RE.search(tr)) or tr == ja:
             continue
         clean.append({"ja": ja, "tr": tr, "note": str(t.get("note", "")).strip()[:60]})
+    # имена из описания зрителя — главнее всего, что придумала модель
+    fixed = {}
+    for ru, kana in context_names(ctx_file):
+        fixed[kana] = {"ja": kana, "tr": ru, "note": "из описания персонажей"}
+    # катакана перед обращением (イルカ先生, ナルト君) — это имя, даже если это ещё и слово
+    for m in re.finditer(r"([\u30a1-\u30fa\u30fc]{2,})(?=先生|せんせい|さん|君|くん|ちゃん|様|さま|殿)", text):
+        kana = m.group(1)
+        exact = transliterate(kana, lang)
+        if exact and kana not in fixed:
+            fixed[kana] = {"ja": kana, "tr": exact, "note": "имя (стоит перед обращением)"}
+    clean = list(fixed.values()) + [t for t in clean if t["ja"] not in fixed]
     terms = clean[:25]
     for t in terms:
         print(f"  {t['ja']} → {t['tr']}" + (f" ({t['note']})" if t.get("note") else ""), flush=True)
@@ -603,7 +685,7 @@ def translate_local(work, path, lines, lang, ctx_file, keep_honorifics, model):
               + "\nДля каждой реплики верни её id, её японский оригинал (ja) без изменений и "
                 "исправленный перевод (tr) именно этой реплики.")
 
-    fixed = 0
+    fixed = shortened = 0
     done_before = 0
     for scene in scenes(lines):
         progress("translate", done_before, len(lines))
@@ -623,11 +705,15 @@ def translate_local(work, path, lines, lang, ctx_file, keep_honorifics, model):
         except Exception as e:  # черновик лучше, чем ничего
             print(f"Редактура сцены не удалась ({e}), оставляю черновик.", flush=True)
             edited = {}
+        seen = {}  # перевод -> японский оригинал: одинаковый перевод разных реплик = сдвиг
         for l in todo:
             best, reason = "", "нет ответа"
             for got in (edited.get(l["id"]), draft.get(l["id"])):  # сначала редактура
                 if got:
-                    reason = bad_translation(l, got[1], got[0], lang)
+                    reason = bad_translation(l, got[1], got[0], lang, terms)
+                    key = _norm(got[1]).lower()
+                    if not reason and key in seen and _norm(seen[key]) != _norm(l["ja"]):
+                        reason = "перевод совпал с соседней репликой — похоже, съехал"
                     if not reason:
                         best = got[1]
                         break
@@ -643,18 +729,41 @@ def translate_local(work, path, lines, lang, ctx_file, keep_honorifics, model):
                 except Exception:
                     got = None
                 if got:
-                    reason = bad_translation(l, got[1], None, lang)
+                    reason = bad_translation(l, got[1], None, lang, terms)
                     best = got[1] if not reason or not best else best
-            if reason and best:
-                best = CJK_RE.sub("", best).strip()  # последний шанс: вычистить иероглифы
+            if reason and best:  # последний шанс: вычистить иероглифы и латиницу
+                best = CJK_RE.sub("", best)
+                if lang in CYRILLIC and not LATIN_RE.search(l["ja"]):
+                    best = " ".join(w for w in best.split() if not LATIN_RE.search(w))
+                best = re.sub(r"\s+([,.!?…])", r"\1", best).strip()
             if attempt:
                 fixed += 1
             l["tr"] = best
             l["done"] = True
-            print(f"{l['ja']}\n  → {best}", flush=True)
+            if best:
+                seen[_norm(best).lower()] = l["ja"]
+        # реплики, которые не влезут даже с ускорением, просим сократить
+        long = [l for l in todo if len(l["tr"]) > max_chars(l) * 1.3]
+        if long:
+            ask = [{"id": l["id"], "ja": l["ja"], "tr": l["tr"], "max_chars": max_chars(l)}
+                   for l in long]
+            try:
+                short = _ask_lines(model, SHORTEN_PROMPT.format(lang=LANG_NAMES.get(lang, lang))
+                                   + glossary, json.dumps(ask, ensure_ascii=False))
+            except Exception:
+                short = {}
+            for l in long:
+                got = short.get(l["id"])
+                if got and len(got[1]) < len(l["tr"]) and not bad_translation(l, got[1], None, lang, terms):
+                    l["tr"] = got[1]
+                    shortened += 1
+        for l in todo:
+            print(f"{l['ja']}\n  → {l['tr']}", flush=True)
         save(path, lines)
     if fixed:
         print(f"Переведено заново по одной: {fixed} реплик(и)", flush=True)
+    if shortened:
+        print(f"Сокращено длинных реплик, чтобы влезли по времени: {shortened}", flush=True)
     progress("translate", len(lines), len(lines))
     ollama_unload(model)
 
@@ -673,6 +782,70 @@ def make_ref(vocals, sr, line, path):
     return True
 
 
+def cluster_speakers(embs, threshold=0.25):
+    """Группы похожих голосов по «отпечаткам» реплик: {номер реплики в списке: группа}."""
+    import numpy as np
+    if len(embs) < 2:
+        return {i: i for i in range(len(embs))}
+    from sklearn.cluster import AgglomerativeClustering
+    x = np.stack([e / (np.linalg.norm(e) + 1e-9) for e in embs])
+    labels = AgglomerativeClustering(n_clusters=None, metric="cosine", linkage="average",
+                                     distance_threshold=threshold).fit_predict(x)
+    return {i: int(g) for i, g in enumerate(labels)}
+
+
+def speaker_refs(work, tts, lines, vocals, vsr):
+    """Для каждой реплики — общий образец голоса её персонажа (до ~15 с его лучших реплик).
+    Возвращает {id реплики: [пути к образцам]} или {} если не получилось."""
+    import numpy as np
+    import soundfile as sf
+    raw_dir = work / "refs_raw"
+    raw_dir.mkdir(exist_ok=True)
+    cache = work / "speakers.json"
+    good = [l for l in lines if l["end"] - l["start"] >= 1.0]
+    if len(good) < 2:
+        return {}
+    try:
+        groups = load(cache) if cache.exists() else None
+        if groups is None or set(map(int, groups)) != {l["id"] for l in good}:
+            model = tts.synthesizer.tts_model
+            embs = []
+            print("Определяю, кто говорит (группирую реплики по голосам)...", flush=True)
+            for n, l in enumerate(good, 1):
+                progress("synth", 0, 1)
+                clip = vocals[int(l["start"] * vsr):int(l["end"] * vsr)]
+                path = raw_dir / f"{l['id']:04d}.wav"
+                sf.write(path, clip, vsr)
+                _, emb = model.get_conditioning_latents(audio_path=[str(path)])
+                embs.append(emb.detach().float().cpu().numpy().reshape(-1))
+            labels = cluster_speakers(embs)
+            groups = {str(l["id"]): labels[i] for i, l in enumerate(good)}
+            save(cache, groups)
+        by_group = {}
+        for l in good:
+            by_group.setdefault(groups[str(l["id"])], []).append(l)
+        real = [g for g in by_group.values() if len(g) >= 2]
+        print(f"Найдено голосов: {len(real)} (реплик с общим образцом: "
+              f"{sum(len(g) for g in real)})", flush=True)
+        out = {}
+        for g in real:
+            best, total = [], 0.0
+            for l in sorted(g, key=lambda l: l["end"] - l["start"], reverse=True):
+                path = raw_dir / f"{l['id']:04d}.wav"
+                if not path.exists():
+                    sf.write(path, vocals[int(l["start"] * vsr):int(l["end"] * vsr)], vsr)
+                best.append((l["id"], str(path)))
+                total += l["end"] - l["start"]
+                if total >= 15 or len(best) >= 5:
+                    break
+            for l in g:
+                out[l["id"]] = [p for i, p in best if i != l["id"]][:4]
+        return out
+    except Exception as e:  # noqa: BLE001 — без группировки озвучка всё равно работает
+        print(f"Не удалось определить голоса ({e}) — образцом будет сама реплика.", flush=True)
+        return {}
+
+
 def stage_synth(work, lang):
     import soundfile as sf
     dev = setup_cuda_dlls()
@@ -688,12 +861,23 @@ def stage_synth(work, lang):
     ref_dir.mkdir(exist_ok=True)
 
     todo = [l for l in lines if l["tr"].strip()]
+    pending = [l for l in todo if not ((out_dir / f"{l['id']:04d}.wav").exists()
+               and (out_dir / f"{l['id']:04d}.txt").exists()
+               and (out_dir / f"{l['id']:04d}.txt").read_text(encoding="utf-8") == l["tr"])]
     tts = None
+    refs = {}
+
+    def load_tts():
+        nonlocal tts
+        print("Загрузка XTTS-v2 (при первом запуске скачивается ~2 ГБ)...", flush=True)
+        free_gpu()
+        tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(dev)
+
     for n, l in enumerate(todo, 1):
         progress("synth", n, len(todo))
         wav = out_dir / f"{l['id']:04d}.wav"
         txt = out_dir / f"{l['id']:04d}.txt"
-        if wav.exists() and txt.exists() and txt.read_text(encoding="utf-8") == l["tr"]:
+        if l not in pending:
             continue
         ref = ref_dir / f"{l['id']:04d}.wav"
         if not make_ref(vocals, vsr, l, ref):
@@ -702,10 +886,12 @@ def stage_synth(work, lang):
         for attempt in (1, 2):
             try:
                 if tts is None:
-                    print("Загрузка XTTS-v2 (при первом запуске скачивается ~2 ГБ)...", flush=True)
-                    free_gpu()
-                    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(dev)
-                tts.tts_to_file(text=l["tr"], speaker_wav=str(ref),
+                    load_tts()
+                    if not refs:
+                        refs = speaker_refs(work, tts, todo, vocals, vsr)
+                # своя реплика (эмоция момента) + общий образец персонажа (тембр)
+                speaker = [str(ref)] + refs.get(l["id"], [])
+                tts.tts_to_file(text=l["tr"], speaker_wav=speaker if len(speaker) > 1 else str(ref),
                                 language=XTTS_LANG.get(lang, lang), file_path=str(wav))
                 break
             except RuntimeError as e:
@@ -732,16 +918,30 @@ def speed_up(src, rate, dst):
          "-filter:a", f"atempo={rate:.3f}", "-ac", "1", "-ar", SR, dst])
 
 
-def stage_mix(video, work, out_path, voice_gain, bg_gain):
+def gap_mask(n, spans, sr, pad=0.15, fade=0.08):
+    """1 там, где русской реплики нет (там оставим оригинальный голос), 0 — где она есть.
+    Края плавные, чтобы переходы не щёлкали."""
+    import numpy as np
+    covered = np.zeros(n, dtype=np.float32)
+    for a, b in spans:
+        covered[max(0, int((a - pad) * sr)):min(n, int((b + pad) * sr))] = 1.0
+    k = max(1, int(fade * sr))
+    if k > 1:
+        covered = np.convolve(covered, np.ones(k, dtype=np.float32) / k, mode="same")
+    return 1.0 - np.clip(covered, 0.0, 1.0)
+
+
+def stage_mix(video, work, out_path, voice_gain, bg_gain, keep_original=True):
     import librosa
     import numpy as np
     import soundfile as sf
     lines = load(work / "lines.json")
-    _, nov = sep_paths(work)
+    voc_path, nov = sep_paths(work)
     bg, _ = sf.read(nov, dtype="float32")
     if bg.ndim == 1:
         bg = np.stack([bg, bg], axis=1)
     dub = np.zeros(len(bg), dtype=np.float32)
+    spans = []
     total = len(bg) / SR
     tmp, fast = work / "tmp_stretch.wav", work / "tmp_fast.wav"
 
@@ -763,8 +963,20 @@ def stage_mix(video, work, out_path, voice_gain, bg_gain):
         s = int(l["start"] * SR)
         e = min(s + len(y), len(dub))
         dub[s:e] += y[:e - s]
+        spans.append((l["start"], max(l["end"], e / SR)))
 
     mix = bg * bg_gain + dub[:, None] * voice_gain
+    if keep_original:
+        # речь, которую не распознали или не озвучили, звучит оригиналом — без «немых» мест
+        orig, _ = sf.read(voc_path, dtype="float32")
+        if orig.ndim == 1:
+            orig = np.stack([orig, orig], axis=1)
+        n = min(len(orig), len(mix))
+        mask = gap_mask(n, spans, SR)
+        mix[:n] += orig[:n] * mask[:, None] * voice_gain
+        kept = float((mask > 0.5).mean()) * 100
+        print(f"Оригинальный голос оставлен там, где нет русской реплики (~{kept:.0f}% времени).",
+              flush=True)
     peak = np.abs(mix).max()
     if peak > 0.99:
         mix = mix / peak * 0.99
@@ -793,6 +1005,8 @@ def main():
     p.add_argument("--until", choices=STAGES)
     p.add_argument("--voice-gain", type=float, default=1.0)
     p.add_argument("--bg-gain", type=float, default=1.0)
+    p.add_argument("--no-original-gaps", action="store_true",
+                   help="не оставлять оригинальный голос там, где нет русской реплики")
     a = p.parse_args()
     WHISPER = a.whisper
     try:  # на процессоре — все ядра
@@ -809,11 +1023,12 @@ def main():
     steps = {
         "extract": lambda: stage_extract(video, work),
         "separate": lambda: stage_separate(work),
-        "transcribe": lambda: stage_transcribe(work),
+        "transcribe": lambda: stage_transcribe(work, a.context),
         "translate": lambda: stage_translate(work, a.lang, a.context, a.keep_honorifics,
                                              a.translator, a.local_model),
         "synth": lambda: stage_synth(work, a.lang),
-        "mix": lambda: stage_mix(video, work, out, a.voice_gain, a.bg_gain),
+        "mix": lambda: stage_mix(video, work, out, a.voice_gain, a.bg_gain,
+                                 not a.no_original_gaps),
     }
     for name in STAGES:
         print(f"\n=== {name} ===", flush=True)

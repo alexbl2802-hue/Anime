@@ -289,7 +289,7 @@ class App(tk.Tk):
         self.translator.trace_add("write", lambda *_: self._toggle_key())
         self._toggle_key()
 
-        ttk.Label(top, text="Персонажи и манера\nречи (для перевода):").grid(
+        ttk.Label(top, text="Персонажи — по строке:\n«Имя — кто это, как\nговорит»").grid(
             row=3, column=0, sticky="nw", **pad)
         self.ctx = tk.Text(top, height=5, wrap="word", font=("Segoe UI", 10))
         self.ctx.grid(row=3, column=1, columnspan=2, sticky="ew", **pad)
