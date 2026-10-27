@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Даб — собственный талисман AnimeDub: круглый зверёк в наушниках с микрофоном -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="160dp"
+    android:height="160dp"
+    android:viewportWidth="160"
+    android:viewportHeight="160">
+    <!-- ушки -->
+    <path android:fillColor="#FFB3CF" android:pathData="M38,62L30,18L70,44z" />
+    <path android:fillColor="#FFB3CF" android:pathData="M122,62L130,18L90,44z" />
+    <path android:fillColor="#FF4F8B" android:pathData="M40,52L36,28L58,44z" />
+    <path android:fillColor="#FF4F8B" android:pathData="M120,52L124,28L102,44z" />
+    <!-- тело -->
+    <path android:fillColor="#FFD6E5" android:pathData="M80,36a52,50 0,1 1,0 100a52,50 0,1 1,0 -100z" />
+    <!-- дуга наушников -->
+    <path android:strokeColor="#7C4DFF" android:strokeWidth="8" android:fillColor="#00000000"
+        android:pathData="M30,86C30,46 130,46 130,86" />
+    <path android:fillColor="#7C4DFF" android:pathData="M20,76h18v32h-18a6,6 0,0 1,-6 -6v-20a6,6 0,0 1,6 -6z" />
+    <path android:fillColor="#7C4DFF" android:pathData="M140,76h-18v32h18a6,6 0,0 0,6 -6v-20a6,6 0,0 0,-6 -6z" />
+    <!-- глаза -->
+    <path android:fillColor="#2B2140" android:pathData="M60,74a10,12 0,1 1,0 24a10,12 0,1 1,0 -24z" />
+    <path android:fillColor="#2B2140" android:pathData="M100,74a10,12 0,1 1,0 24a10,12 0,1 1,0 -24z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M63,78a4,4 0,1 1,0 8a4,4 0,1 1,0 -8z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M103,78a4,4 0,1 1,0 8a4,4 0,1 1,0 -8z" />
+    <!-- румянец и рот -->
+    <path android:fillColor="#FF8FB5" android:pathData="M44,102a7,4 0,1 1,0 8a7,4 0,1 1,0 -8z" />
+    <path android:fillColor="#FF8FB5" android:pathData="M116,102a7,4 0,1 1,0 8a7,4 0,1 1,0 -8z" />
+    <path android:strokeColor="#2B2140" android:strokeWidth="3" android:fillColor="#00000000"
+        android:strokeLineCap="round" android:pathData="M72,106q8,7 16,0" />
+    <!-- микрофон на штанге -->
+    <path android:strokeColor="#7C4DFF" android:strokeWidth="4" android:fillColor="#00000000"
+        android:strokeLineCap="round" android:pathData="M128,104Q124,124 100,122" />
+    <path android:fillColor="#2B2140" android:pathData="M96,117a6,6 0,1 1,0 12a6,6 0,1 1,0 -12z" />
+</vector>

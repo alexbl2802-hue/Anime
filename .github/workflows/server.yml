@@ -1,0 +1,64 @@
+name: Проверка AnimeDub-сервера
+
+# Ставит сервер скриптом install.sh на чистую Ubuntu (ARM, как бесплатный Oracle Cloud, и x86)
+# и проверяет, что он запускается и отвечает приложению.
+on:
+  push:
+    paths: ["server/**", "headless.py", "jobs.py", "server.py", "dub.py",
+            ".github/workflows/server.yml"]
+  workflow_dispatch:
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установка скриптом install.sh
+        env:
+          ANIMEDUB_BRANCH: ${{ github.ref_name }}
+          SKIP_MODEL: "1"
+          SKIP_SERVICE: "1"
+          SKIP_TAILSCALE: "1"
+        run: bash server/install.sh
+
+      - name: Сервер запускается и отвечает
+        run: |
+          export ANIMEDUB_HOME=$HOME/animedub
+          PY=$ANIMEDUB_HOME/venv/bin/python
+          $PY $ANIMEDUB_HOME/app/headless.py > server.log 2>&1 &
+          sleep 5
+          KEY=$($PY -c "import json;print(json.load(open('$ANIMEDUB_HOME/config.json'))['key'])")
+          curl -fsS -H "X-Key: $KEY" http://127.0.0.1:8765/api/info
+          curl -fsS -H "X-Key: $KEY" http://127.0.0.1:8765/api/sources
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/api/info)" = 401
+          cat server.log
+
+      # Настоящий прогон до готового видео: отделение голоса, озвучка XTTS, сведение.
+      # Перевод уже «готов» (lines.json), чтобы не качать 5 ГБ модели перевода.
+      - name: Сквозная проверка конвейера (demucs, XTTS, сведение)
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          COQUI_TOS_AGREED: "1"
+        run: |
+          sudo apt-get install -y -q espeak-ng >/dev/null
+          PY=$HOME/animedub/venv/bin/python
+          APP=$HOME/animedub/app
+          mkdir -p e2e/work_ep && cd e2e
+          espeak-ng -v en -w voice.wav "Hello. This is a short test of the dubbing pipeline. One, two, three, four, five, six."
+          ffmpeg -nostdin -loglevel error -f lavfi -i color=c=black:s=320x240:r=10 -i voice.wav -shortest -c:v libx264 -c:a aac ep.mp4
+          $PY -c "import json; json.dump([{'id': 0, 'start': 0.3, 'end': 2.6, 'ja': 'テスト', 'tr': 'Привет, это проверка.', 'done': True}, {'id': 1, 'start': 2.8, 'end': 5.6, 'ja': 'テスト', 'tr': 'Раз, два, три.', 'done': True}], open('work_ep/lines.json', 'w'), ensure_ascii=False)"
+          $PY $APP/dub.py ep.mp4 --lang ru --translator local --whisper tiny 2>&1 | tee dub.log
+          test "${PIPESTATUS[0]}" = 0
+          # голоса должны сгруппироваться настоящим XTTS, а пустоты — заполниться оригиналом
+          grep -q "Найдено голосов" dub.log
+          ! grep -q "Не удалось определить голоса" dub.log
+          grep -q "Оригинальный голос оставлен" dub.log
+          echo "Дорожки в готовом файле:"; ffprobe -v error -show_entries stream=codec_type:stream_tags=title -of csv=p=0 ep_dub_ru.mkv
+          test "$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 ep_dub_ru.mkv | wc -l)" = 2
+          # распознавание — тем же кодом, что и в программе (модель tiny для скорости)
+          $PY -c "import sys; sys.path.insert(0, '$APP'); import dub; dub.WHISPER = 'tiny'; print('Whisper:', dub.transcribe_with('cpu', 'voice.wav'))"

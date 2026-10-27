@@ -1,0 +1,7 @@
+__pycache__/
+build/
+dist/
+*.spec
+work_*/
+.gradle/
+local.properties
