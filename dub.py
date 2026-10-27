@@ -218,6 +218,8 @@ def clean_lines(raw):
 def stage_transcribe(work):
     out = work / "lines.json"
     if out.exists():
+        print(f"Речь уже распознана раньше — беру готовое. Чтобы распознать и перевести заново, "
+              f"удали папку {work}", flush=True)
         return
     dev = setup_cuda_dlls()
     if dev == "cuda":
@@ -297,6 +299,7 @@ def stage_translate(work, lang, ctx_file, keep_honorifics, translator="claude",
     path = work / "lines.json"
     lines = load(path)
     if all(translated(l) for l in lines):
+        print("Перевод уже готов — беру его (поправить можно в «Редакторе перевода»).", flush=True)
         return
     if translator == "local":
         return translate_local(work, path, lines, lang, ctx_file, keep_honorifics, local_model)
