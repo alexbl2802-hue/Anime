@@ -902,6 +902,10 @@ def stage_synth(work, lang):
                 tts, dev = None, "cpu"
                 free_gpu()
         txt.write_text(l["tr"], encoding="utf-8")
+    done = sum((out_dir / f"{l['id']:04d}.wav").exists() for l in todo)
+    print(f"Озвучено реплик: {done} из {len(todo)}" + (
+        " (остальные слишком короткие — там останется оригинальный голос)"
+        if done < len(todo) else ""), flush=True)
 
 
 # ---------- 6. сведение ----------
