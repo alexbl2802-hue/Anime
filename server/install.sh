@@ -60,8 +60,11 @@ else
 fi
 # demucs 4.1 тянет sphn, которому под ARM нужна сборка на Rust — берём проверенную 4.0.1
 export CMAKE_POLICY_VERSION_MINIMUM=3.5  # на случай сборки из исходников с новым CMake
-"$PY" -m pip install -q coqui-tts faster-whisper demucs==4.0.1 soundfile librosa $PINS $CPU_INDEX
-"$PY" -c "import torch, faster_whisper, demucs, TTS; print('Нейросети на месте, PyTorch', torch.__version__)"
+# transformers 5 требует PyTorch 2.6+, а с ним ломается demucs — держим 4.x
+"$PY" -m pip install -q coqui-tts faster-whisper demucs==4.0.1 "transformers>=4.57,<5" \
+    soundfile librosa $PINS $CPU_INDEX
+# импортируем то, что реально нужно при работе (XTTS тянет transformers.generation)
+"$PY" -c "import torch, faster_whisper, demucs.pretrained, TTS.tts.models.xtts; print('Нейросети на месте, PyTorch', torch.__version__)"
 
 say "5/7 Переводчик Ollama и модель $MODEL"
 if ! command -v ollama >/dev/null; then

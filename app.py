@@ -59,7 +59,9 @@ TORCH_SOURCES = [("index", TORCH_INDEX),
                  ("links", "https://mirrors.aliyun.com/pytorch-wheels/cu124/"),
                  ("index", "https://mirrors.nju.edu.cn/pytorch/whl/cu124")]
 TORCH_PINS = ["torch==2.5.1", "torchaudio==2.5.1"]  # новее ломают demucs (torch.load) и torchaudio.load
-REQS = ["coqui-tts", "faster-whisper", "demucs==4.0.1", "anthropic", "soundfile", "librosa"]
+# transformers 5 требует PyTorch 2.6+, а с ним ломается demucs (torch.load) — держим 4.x
+REQS = ["coqui-tts", "faster-whisper", "demucs==4.0.1", "transformers>=4.57,<5", "anthropic",
+        "soundfile", "librosa"]
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 CHARS_PER_SEC = 14
 
@@ -102,7 +104,8 @@ def child_env(api_key=""):
              str(Path(local) / "Programs" / "Python" / "Launcher")]
     env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
     env.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1",
-               COQUI_TOS_AGREED="1")
+               COQUI_TOS_AGREED="1", HF_HUB_DISABLE_SYMLINKS_WARNING="1",
+               TRANSFORMERS_NO_ADVISORY_WARNINGS="1")
     if api_key:
         env["ANTHROPIC_API_KEY"] = api_key
     return env

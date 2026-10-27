@@ -7,6 +7,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -163,16 +164,55 @@ def transcribe_with(dev, vocals):
         print(f"Модель распознавания {WHISPER} недоступна ({e}), беру large-v3.", flush=True)
         model = WhisperModel("large-v3", device=dev, compute_type=compute,
                              cpu_threads=os.cpu_count() or 4)
-    segs, info = model.transcribe(str(vocals), language="ja", vad_filter=True, beam_size=5)
-    lines = []
+    # condition_on_previous_text=False — Whisper не «зацикливается» на одной фразе
+    segs, info = model.transcribe(str(vocals), language="ja", vad_filter=True, beam_size=5,
+                                  condition_on_previous_text=False)
+    raw = []
     for s in segs:
         progress("transcribe", s.end, info.duration)
         t = s.text.strip()
         if t:
-            lines.append({"id": len(lines), "start": round(s.start, 2),
-                          "end": round(s.end, 2), "ja": t, "tr": ""})
+            raw.append({"start": round(s.start, 2), "end": round(s.end, 2), "ja": t,
+                        "no_speech": s.no_speech_prob, "logprob": s.avg_logprob})
             print(f"[{s.start:7.1f}] {t}", flush=True)
-    return lines
+    return clean_lines(raw)
+
+
+# фразы, которые Whisper «слышит» в музыке и титрах, хотя их никто не говорит
+PHANTOMS = ("ご視聴ありがとうございました", "ご視聴ありがとうございます", "チャンネル登録",
+            "最後までご視聴", "字幕", "おやすみなさい。おやすみなさい")
+
+
+def _norm(text):
+    return re.sub(r"[\s、。!！?？…・「」『』~〜ー-]", "", text)
+
+
+def clean_lines(raw):
+    """Убираем фантомные фразы, зацикленные повторы и «речь» в тишине."""
+    out, dropped = [], 0
+    i = 0
+    while i < len(raw):
+        seg = raw[i]
+        # серия одинаковых реплик подряд (3+) — повтор распознавания, оставляем первую
+        j = i
+        while j + 1 < len(raw) and _norm(raw[j + 1]["ja"]) == _norm(seg["ja"]):
+            j += 1
+        run = j - i + 1
+        keep = [seg] if run >= 3 else raw[i:j + 1]
+        dropped += run - len(keep)
+        for k in keep:
+            text = _norm(k["ja"])
+            phantom = any(_norm(p) in text for p in PHANTOMS) and len(text) <= 20
+            silent = k.get("no_speech", 0) > 0.6 and k.get("logprob", 0) < -1.0
+            if phantom or silent or not text:
+                dropped += 1
+                continue
+            out.append({"id": len(out), "start": k["start"], "end": k["end"],
+                        "ja": k["ja"], "tr": ""})
+        i = j + 1
+    if dropped:
+        print(f"Убрано лишних реплик (повторы и шум): {dropped}", flush=True)
+    return out
 
 
 def stage_transcribe(work):
@@ -294,8 +334,9 @@ LINES_SCHEMA = {
     "type": "object",
     "properties": {"lines": {"type": "array", "items": {
         "type": "object",
-        "properties": {"id": {"type": "integer"}, "tr": {"type": "string"}},
-        "required": ["id", "tr"]}}},
+        "properties": {"id": {"type": "integer"}, "ja": {"type": "string"},
+                       "tr": {"type": "string"}},
+        "required": ["id", "ja", "tr"]}}},
     "required": ["lines"],
 }
 TERMS_SCHEMA = {
@@ -309,10 +350,11 @@ TERMS_SCHEMA = {
 }
 
 GLOSSARY_PROMPT = """Ниже — японские реплики серии аниме (распознаны автоматически, возможны ошибки).
-Выпиши имена персонажей, прозвища, названия мест и особые термины, которые нужно переводить
-одинаково во всей серии. Для каждого дай написание на языке «{lang}» (имена — по системе
-Поливанова для русского) и короткую пометку (кто это, пол, как говорит), если понятно из контекста.
-Не выдумывай того, чего нет в тексте. Не больше 30 пунктов.{context}
+Выпиши ТОЛЬКО имена персонажей, их прозвища и титулы, а также названия мест — то, что нужно
+писать одинаково во всей серии. Приёмы, техники и обычные слова НЕ выписывай.
+В поле ja — имя точно как в тексте, в tr — как его писать на языке «{lang}» (для русского —
+кириллицей по системе Поливанова), в note — кто это и пол, если понятно из контекста.
+Не выдумывай того, чего нет в тексте. Не больше 25 пунктов.{context}
 
 Реплики:
 {text}"""
@@ -326,6 +368,85 @@ EDIT_PROMPT = """Ты — редактор русского дубляжа ан�
 - каждая реплика должна уложиться в max_chars символов, иначе сократи;
 - если реплика уже звучит хорошо — оставь её как есть.
 Верни все реплики с теми же id."""
+
+
+# ---------- кана -> кириллица (Поливанов) / латиница (Хэпбёрн) ----------
+_KANA = {}
+for _row in """ア a а|イ i и|ウ u у|エ e э|オ o о|カ ka ка|キ ki ки|ク ku ку|ケ ke кэ|コ ko ко
+|サ sa са|シ shi си|ス su су|セ se сэ|ソ so со|タ ta та|チ chi ти|ツ tsu цу|テ te тэ|ト to то
+|ナ na на|ニ ni ни|ヌ nu ну|ネ ne нэ|ノ no но|ハ ha ха|ヒ hi хи|フ fu фу|ヘ he хэ|ホ ho хо
+|マ ma ма|ミ mi ми|ム mu му|メ me мэ|モ mo мо|ヤ ya я|ユ yu ю|ヨ yo ё|ラ ra ра|リ ri ри
+|ル ru ру|レ re рэ|ロ ro ро|ワ wa ва|ヲ o о|ン n н|ガ ga га|ギ gi ги|グ gu гу|ゲ ge гэ
+|ゴ go го|ザ za дза|ジ ji дзи|ズ zu дзу|ゼ ze дзэ|ゾ zo дзо|ダ da да|ヂ ji дзи|ヅ zu дзу
+|デ de дэ|ド do до|バ ba ба|ビ bi би|ブ bu бу|ベ be бэ|ボ bo бо|パ pa па|ピ pi пи|プ pu пу
+|ペ pe пэ|ポ po по|ヴ vu ву|キャ kya кя|キュ kyu кю|キョ kyo кё|シャ sha ся|シュ shu сю
+|ショ sho сё|チャ cha тя|チュ chu тю|チョ cho тё|ニャ nya ня|ニュ nyu ню|ニョ nyo нё
+|ヒャ hya хя|ヒュ hyu хю|ヒョ hyo хё|ミャ mya мя|ミュ myu мю|ミョ myo мё|リャ rya ря
+|リュ ryu рю|リョ ryo рё|ギャ gya гя|ギュ gyu гю|ギョ gyo гё|ジャ ja дзя|ジュ ju дзю
+|ジョ jo дзё|ビャ bya бя|ビュ byu бю|ビョ byo бё|ピャ pya пя|ピュ pyu пю|ピョ pyo пё
+|ファ fa фа|フィ fi фи|フェ fe фэ|フォ fo фо|ティ ti ти|ディ di ди|ウィ wi ви|ウェ we вэ
+|シェ she сэ|ジェ je дзэ|チェ che тэ""".replace("\n", "").split("|"):
+    _k, _lat, _cyr = _row.split()
+    _KANA[_k] = (_lat, _cyr)
+CYRILLIC = {"ru", "uk"}
+CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]")
+LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+def transliterate(text, lang):
+    """Имя, записанное каной -> «Наруто» / «Naruto». None, если там не только кана."""
+    kata = "".join(chr(ord(c) + 0x60) if "\u3041" <= c <= "\u3096" else c
+                   for c in text.strip().replace("・", " ").replace("=", " "))
+    cyr = lang in CYRILLIC
+    out, i, double = [], 0, False
+    while i < len(kata):
+        c = kata[i]
+        if c == " ":
+            out.append(" ")
+            i += 1
+            continue
+        if c == "ッ":
+            double = True
+            i += 1
+            continue
+        if c == "ー":  # долгота — опускаем
+            i += 1
+            continue
+        pair = _KANA.get(kata[i:i + 2]) if len(kata[i:i + 2]) == 2 else None
+        lat, ru = pair if pair else _KANA.get(c, (None, None))
+        if lat is None:
+            return None
+        step = 2 if pair else 1
+        prev = out[-1] if out else ""
+        if c == "ウ" and not pair and prev and prev[-1] in "ouоуёю":
+            i += step  # オウ/ユウ — долгая гласная
+            continue
+        if c == "イ" and not pair and cyr and prev and prev[-1] in "аоуэ":
+            ru = "й"  # カイ -> кай
+        syl = ru if cyr else lat
+        if double:
+            syl = ("т" if cyr and syl.startswith("ч") else syl[0]) + syl
+            double = False
+        out.append(syl)
+        i += step
+    word = "".join(out).strip()
+    return " ".join(w[:1].upper() + w[1:] for w in word.split()) or None
+
+
+def bad_translation(line, tr, echo, lang):
+    """Причина, по которой перевод реплики не годится, или None."""
+    if not tr.strip():
+        return "пусто"
+    if lang not in ("ja", "zh") and CJK_RE.search(tr):
+        return "иероглифы в переводе"
+    if lang in CYRILLIC and LATIN_RE.search(tr) and not LATIN_RE.search(line["ja"]):
+        return "латиница в русском тексте"
+    if echo is not None:
+        import difflib
+        a, b = _norm(echo), _norm(line["ja"])
+        if a and b and difflib.SequenceMatcher(None, a, b).ratio() < 0.5:
+            return "перевод съехал на другую реплику"
+    return None
 
 
 def ollama_exe():
@@ -364,7 +485,7 @@ def ensure_ollama():
 def ollama_chat(model, system, user, schema, keep_alive="10m", tries=3):
     body = json.dumps({
         "model": model, "stream": False, "format": schema, "keep_alive": keep_alive,
-        "options": {"temperature": 0.4, "num_ctx": 8192},
+        "options": {"temperature": 0.3, "num_ctx": 8192},
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
     }).encode("utf-8")
     for attempt in range(1, tries + 1):
@@ -421,11 +542,41 @@ def build_glossary(work, lines, model, lang, ctx_file):
     except Exception as e:  # словарь полезен, но не обязателен
         print(f"Словарь составить не удалось ({e}), перевожу без него.", flush=True)
         terms = []
-    terms = [t for t in terms if t.get("ja") and t.get("tr")][:30]
+    clean = []
+    for t in terms:
+        ja, tr = str(t.get("ja", "")).strip(), str(t.get("tr", "")).strip()
+        if not ja or not tr or ja not in text:
+            continue  # пусто или выдумано
+        exact = transliterate(ja, lang)
+        if exact:
+            tr = exact  # имя каной — точно по таблице, а не как придумала модель
+        elif CJK_RE.search(tr) or (lang in CYRILLIC and LATIN_RE.search(tr)) or tr == ja:
+            continue
+        clean.append({"ja": ja, "tr": tr, "note": str(t.get("note", "")).strip()[:60]})
+    terms = clean[:25]
     for t in terms:
         print(f"  {t['ja']} → {t['tr']}" + (f" ({t['note']})" if t.get("note") else ""), flush=True)
     save(path, terms)
     return terms
+
+
+def _ask_lines(model, system, msg):
+    """{id: (ja-повтор, перевод)} из ответа модели."""
+    out = {}
+    for d in ollama_chat(model, system, msg, LINES_SCHEMA).get("lines", []):
+        if isinstance(d, dict) and isinstance(d.get("id"), int):
+            out[d["id"]] = (str(d.get("ja", "")), str(d.get("tr", "")).strip())
+    return out
+
+
+def _context_msg(lines, pos, count, payload, title):
+    prev = [{"ja": l["ja"], "tr": l["tr"]} for l in lines[max(0, pos - 8):pos] if l["tr"]]
+    nxt = [l["ja"] for l in lines[pos + count:pos + count + 5]]
+    return ("Предыдущие реплики (уже переведены, для связности):\n"
+            + json.dumps(prev, ensure_ascii=False)
+            + f"\n\n{title}\n" + json.dumps(payload, ensure_ascii=False)
+            + "\n\nДальше в сцене (не переводить, только контекст):\n"
+            + json.dumps(nxt, ensure_ascii=False))
 
 
 def translate_local(work, path, lines, lang, ctx_file, keep_honorifics, model):
@@ -435,46 +586,69 @@ def translate_local(work, path, lines, lang, ctx_file, keep_honorifics, model):
     if terms:
         glossary = "\nСловарь (переводи строго так):\n" + "\n".join(
             f"- {t['ja']} → {t['tr']}" + (f" ({t['note']})" if t.get("note") else "") for t in terms)
-    system = translate_system(lang, ctx_file, keep_honorifics, glossary)
+    purity = (f"\n- Пиши только на языке «{LANG_NAMES.get(lang, lang)}»: никаких китайских или японских"
+              " иероглифов и никакой латиницы в именах.")
+    system = translate_system(lang, ctx_file, keep_honorifics, purity + glossary)
     system = system.replace("Ответь ТОЛЬКО JSON-массивом: [{\"id\": 0, \"tr\": \"...\"}, ...] — без пояснений и markdown.",
-                            "Ответь JSON-объектом {\"lines\": [{\"id\": 0, \"tr\": \"...\"}]} со всеми репликами.")
-    editor = EDIT_PROMPT.format(lang=LANG_NAMES.get(lang, lang)) + glossary
+                            "Ответь JSON-объектом {\"lines\": [{\"id\": 0, \"ja\": \"оригинал\", "
+                            "\"tr\": \"перевод\"}]}: для КАЖДОЙ реплики её id, её японский оригинал "
+                            "без изменений и перевод именно этой реплики.")
+    editor = (EDIT_PROMPT.format(lang=LANG_NAMES.get(lang, lang)) + purity + glossary
+              + "\nДля каждой реплики верни её id, её японский оригинал (ja) без изменений и "
+                "исправленный перевод (tr) именно этой реплики.")
 
-    parts = scenes(lines)
+    fixed = 0
     done_before = 0
-    for n, scene in enumerate(parts):
+    for scene in scenes(lines):
         progress("translate", done_before, len(lines))
         done_before += len(scene)
         todo = [l for l in scene if not translated(l)]
         if not todo:
             continue
         pos = lines.index(scene[0])
-        prev = [{"ja": l["ja"], "tr": l["tr"]} for l in lines[max(0, pos - 8):pos] if l["tr"]]
-        nxt = [l["ja"] for l in lines[pos + len(scene):pos + len(scene) + 5]]
         payload = [{"id": l["id"], "ja": l["ja"], "max_chars": max_chars(l)} for l in todo]
-        msg = ("Предыдущие реплики (уже переведены, для связности):\n"
-               + json.dumps(prev, ensure_ascii=False)
-               + "\n\nПереведи эти реплики:\n" + json.dumps(payload, ensure_ascii=False)
-               + "\n\nДальше в сцене (не переводить, только контекст):\n"
-               + json.dumps(nxt, ensure_ascii=False))
-        draft = {d["id"]: d["tr"] for d in ollama_chat(model, system, msg, LINES_SCHEMA)["lines"]
-                 if isinstance(d, dict) and "id" in d}
+        draft = _ask_lines(model, system, _context_msg(lines, pos, len(scene), payload,
+                                                       "Переведи эти реплики:"))
         # редакторский проход по всей сцене
-        review = [{"id": l["id"], "ja": l["ja"], "draft": draft.get(l["id"], ""),
+        review = [{"id": l["id"], "ja": l["ja"], "draft": draft.get(l["id"], ("", ""))[1],
                    "max_chars": max_chars(l)} for l in todo]
         try:
-            edited = {d["id"]: d["tr"] for d in ollama_chat(
-                model, editor, json.dumps(review, ensure_ascii=False), LINES_SCHEMA)["lines"]
-                if isinstance(d, dict) and "id" in d}
+            edited = _ask_lines(model, editor, json.dumps(review, ensure_ascii=False))
         except Exception as e:  # черновик лучше, чем ничего
             print(f"Редактура сцены не удалась ({e}), оставляю черновик.", flush=True)
             edited = {}
         for l in todo:
-            tr = (edited.get(l["id"]) or draft.get(l["id"]) or "").strip()
-            l["tr"] = tr
-            l["done"] = l["id"] in draft
-            print(f"{l['ja']}\n  → {tr}", flush=True)
+            best, reason = "", "нет ответа"
+            for got in (edited.get(l["id"]), draft.get(l["id"])):  # сначала редактура
+                if got:
+                    reason = bad_translation(l, got[1], got[0], lang)
+                    if not reason:
+                        best = got[1]
+                        break
+            # плохая реплика — переводим её отдельно (до двух раз)
+            attempt = 0
+            while reason and attempt < 2:
+                attempt += 1
+                one = [{"id": l["id"], "ja": l["ja"], "max_chars": max_chars(l)}]
+                hint = f"Переведи ОДНУ эту реплику (прошлый перевод не подошёл: {reason}):"
+                try:
+                    got = _ask_lines(model, system, _context_msg(
+                        lines, lines.index(l), 1, one, hint)).get(l["id"])
+                except Exception:
+                    got = None
+                if got:
+                    reason = bad_translation(l, got[1], None, lang)
+                    best = got[1] if not reason or not best else best
+            if reason and best:
+                best = CJK_RE.sub("", best).strip()  # последний шанс: вычистить иероглифы
+            if attempt:
+                fixed += 1
+            l["tr"] = best
+            l["done"] = True
+            print(f"{l['ja']}\n  → {best}", flush=True)
         save(path, lines)
+    if fixed:
+        print(f"Переведено заново по одной: {fixed} реплик(и)", flush=True)
     progress("translate", len(lines), len(lines))
     ollama_unload(model)
 

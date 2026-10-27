@@ -102,7 +102,8 @@ class Headless:
     def env():
         env = os.environ.copy()
         env.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1",
-                   COQUI_TOS_AGREED="1")
+                   COQUI_TOS_AGREED="1", HF_HUB_DISABLE_SYMLINKS_WARNING="1",
+                   TRANSFORMERS_NO_ADVISORY_WARNINGS="1")
         return env
 
     @staticmethod
